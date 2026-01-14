@@ -1318,6 +1318,10 @@ The operator automatically injects environment variables based on component type
 - **`DYN_SYSTEM_USE_ENDPOINT_HEALTH_STATUS`**: `["generate"]`
 - **`DYN_SYSTEM_ENABLED`**: `true` (needed for runtime images 0.6.1 and older)
 
+- **`NIXL_TELEMETRY_PROMETHEUS_PORT`**: `19090`
+- **`NIXL_TELEMETRY_EXPORTER`**: `prometheus`
+- **`NIXL_TELEMETRY_ENABLE`**: `n` (by default NIXL telemetry is disabled)
+
 ### Planner Components
 
 - **`PLANNER_PROMETHEUS_PORT`**: `9085`
