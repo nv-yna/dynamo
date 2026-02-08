@@ -210,7 +210,6 @@ class WorkerFactory:
             config,
             engine_client,
             vllm_config,
-            migration_limit=config.migration_limit,
         )
 
         metrics_labels = [("model", config.served_model_name or config.model)]
