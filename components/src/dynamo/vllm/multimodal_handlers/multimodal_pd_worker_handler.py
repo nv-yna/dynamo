@@ -33,6 +33,7 @@ from ..multimodal_utils.prefill_worker_utils import (
     accumulate_embeddings,
     fetch_ec_connector_embeddings,
     fetch_embeddings_from_encode_workers,
+    fetch_embeddings_with_cache,
     load_embeddings,
 )
 
@@ -139,6 +140,17 @@ class MultimodalPDWorkerHandler(BaseWorkerHandler):
                     raw_request["token_ids"],
                     request_id,
                 )
+            elif self.embedding_cache_manager is not None:
+                # Standalone encoder with local embedding cache
+                multimodal_groups = await fetch_embeddings_with_cache(
+                    self.embedding_cache_manager,
+                    self.encode_worker_client,  # type: ignore[arg-type]
+                    image_urls,
+                    request_id,
+                    self.EMBEDDINGS_DTYPE,
+                    self.EMBEDDINGS_DEVICE,
+                    self._connector,
+                )
             else:
                 # Standalone encoder: use existing helper
                 multimodal_groups = await fetch_embeddings_from_encode_workers(
@@ -209,6 +221,15 @@ class MultimodalPDWorkerHandler(BaseWorkerHandler):
                 # non-disaggregated mode (vLLM encodes inline).
                 multi_modal_data["image"].append(
                     await self.image_loader.load_image(mi.multimodal_input.image_url)
+                )
+            elif mi.cached_embedding is not None:
+                # Pre-computed embeddings from local cache
+                accumulate_embeddings(
+                    multi_modal_data,
+                    self.config.model,
+                    self.EMBEDDINGS_DTYPE,
+                    mi.cached_embedding,
+                    mi.image_grid_thw,
                 )
             else:
                 # Pre-computed embeddings via NIXL RDMA or local safetensors
@@ -422,10 +443,6 @@ class MultimodalPDWorkerHandler(BaseWorkerHandler):
 
         multi_modal_data = await self._load_multimodal_data(request)
         self._finalize_request_metadata(request, multi_modal_data)
-
-        logger.info(
-            f"Prepared multimodal data size: {len(multi_modal_data.get('image', []))}"
-        )
         logger.debug(f"{multi_modal_data}")
 
         if self.enable_disagg and self.decode_worker_client:
