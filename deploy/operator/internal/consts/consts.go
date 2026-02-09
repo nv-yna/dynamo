@@ -102,7 +102,7 @@ const (
 	RestartAnnotation = "nvidia.com/restartAt"
 
 	// Rolling update annotations
-	AnnotationActiveWorkerHash = "nvidia.com/active-worker-hash"
+	AnnotationCurrentWorkerHash = "nvidia.com/current-worker-hash"
 )
 
 type MultinodeDeploymentType string

@@ -46,6 +46,7 @@ type ComponentContext struct {
 	ParentGraphDeploymentName      string
 	ParentGraphDeploymentNamespace string
 	DiscoveryBackend               string
+	WorkerHashSuffix               string
 }
 
 func (b *BaseComponentDefaults) GetBaseContainer(context ComponentContext) (corev1.Container, error) {
