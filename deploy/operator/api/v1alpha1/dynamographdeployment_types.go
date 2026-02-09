@@ -112,9 +112,9 @@ type DynamoGraphDeploymentStatus struct {
 	// +optional
 	Restart *RestartStatus `json:"restart,omitempty"`
 
-	// Rollout tracks the progress of a rolling update.
+	// RollingUpdate tracks the progress of a rolling update.
 	// +optional
-	Rollout *RolloutStatus `json:"rollout,omitempty"`
+	RollingUpdate *RollingUpdateStatus `json:"rollingUpdate,omitempty"`
 }
 
 // RestartStatus contains the status of the restart of the graph deployment.
@@ -139,29 +139,29 @@ const (
 	RestartPhaseSuperseded RestartPhase = "Superseded"
 )
 
-// RolloutPhase represents the current phase of a rolling update.
+// RollingUpdatePhase represents the current phase of a rolling update.
 // +kubebuilder:validation:Enum=Pending;InProgress;Completed;Failed;""
-type RolloutPhase string
+type RollingUpdatePhase string
 
 const (
-	RolloutPhasePending    RolloutPhase = "Pending"
-	RolloutPhaseInProgress RolloutPhase = "InProgress"
-	RolloutPhaseCompleted  RolloutPhase = "Completed"
-	RolloutPhaseFailed     RolloutPhase = "Failed"
-	RolloutPhaseNone       RolloutPhase = ""
+	RollingUpdatePhasePending    RollingUpdatePhase = "Pending"
+	RollingUpdatePhaseInProgress RollingUpdatePhase = "InProgress"
+	RollingUpdatePhaseCompleted  RollingUpdatePhase = "Completed"
+	RollingUpdatePhaseFailed     RollingUpdatePhase = "Failed"
+	RollingUpdatePhaseNone       RollingUpdatePhase = ""
 )
 
-// RolloutStatus tracks the progress of a rolling update.
-type RolloutStatus struct {
-	// Phase indicates the current phase of the rollout.
+// RollingUpdateStatus tracks the progress of a rolling update.
+type RollingUpdateStatus struct {
+	// Phase indicates the current phase of the rolling update.
 	// +optional
-	Phase RolloutPhase `json:"phase,omitempty"`
+	Phase RollingUpdatePhase `json:"phase,omitempty"`
 
-	// StartTime is when the rollout began.
+	// StartTime is when the rolling update began.
 	// +optional
 	StartTime *metav1.Time `json:"startTime,omitempty"`
 
-	// EndTime is when the rollout completed (successfully or failed).
+	// EndTime is when the rolling update completed (successfully or failed).
 	// +optional
 	EndTime *metav1.Time `json:"endTime,omitempty"`
 }
