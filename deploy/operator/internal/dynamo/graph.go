@@ -1212,9 +1212,6 @@ func GenerateGrovePodCliqueSet(
 	}
 
 	discoveryBackend := controllerConfig.GetDiscoveryBackend(dynamoDeployment.Annotations)
-
-	// Grove pathway doesn't support rolling updates, so use base namespace without hash.
-	// This prevents unnecessary cascading restarts when individual component specs change.
 	dynamoNamespace := ComputeDynamoNamespace(dynamoDeployment)
 
 	var scalingGroups []grovev1alpha1.PodCliqueScalingGroupConfig
