@@ -47,6 +47,7 @@ const (
 	KubeAnnotationDynamoBaseModel       = "nvidia.com/dynamo-base-model"
 	KubeLabelDynamoDiscoveryBackend     = "nvidia.com/dynamo-discovery-backend"
 	KubeLabelDynamoDiscoveryEnabled     = "nvidia.com/dynamo-discovery-enabled"
+	KubeLabelDynamoWorkerHash           = "nvidia.com/dynamo-worker-hash"
 
 	KubeLabelValueFalse = "false"
 	KubeLabelValueTrue  = "true"
@@ -55,11 +56,12 @@ const (
 
 	KubeResourceGPUNvidia = "nvidia.com/gpu"
 
-	DynamoDeploymentConfigEnvVar     = "DYN_DEPLOYMENT_CONFIG"
-	DynamoNamespaceEnvVar            = "DYN_NAMESPACE"
-	DynamoNamespacePrefixEnvVar      = "DYN_NAMESPACE_PREFIX"
-	DynamoComponentEnvVar            = "DYN_COMPONENT"
-	DynamoDiscoveryBackendEnvVar     = "DYN_DISCOVERY_BACKEND"
+	DynamoDeploymentConfigEnvVar          = "DYN_DEPLOYMENT_CONFIG"
+	DynamoNamespaceEnvVar                = "DYN_NAMESPACE"
+	DynamoNamespacePrefixEnvVar          = "DYN_NAMESPACE_PREFIX"
+	DynamoNamespaceWorkerSuffixEnvVar    = "DYN_NAMESPACE_WORKER_SUFFIX"
+	DynamoComponentEnvVar                = "DYN_COMPONENT"
+	DynamoDiscoveryBackendEnvVar         = "DYN_DISCOVERY_BACKEND"
 
 	GlobalDynamoNamespace = "dynamo"
 
