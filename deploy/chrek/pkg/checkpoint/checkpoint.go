@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
-	criurpc "github.com/checkpoint-restore/go-criu/v7/rpc"
+	criurpc "github.com/checkpoint-restore/go-criu/v8/rpc"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
@@ -31,10 +31,11 @@ type CheckpointManifest struct {
 	CheckpointID string    `yaml:"checkpointId"`
 	CreatedAt    time.Time `yaml:"createdAt"`
 
-	CRIUDump   CRIUDumpManifest         `yaml:"criuDump"`
-	K8s        SourcePodManifest        `yaml:"k8s"`
-	Filesystem FilesystemManifest       `yaml:"filesystem"`
-	Namespaces []NamespaceManifestEntry `yaml:"namespaces"`
+	CRIUDump        CRIUDumpManifest         `yaml:"criuDump"`
+	K8s             SourcePodManifest         `yaml:"k8s"`
+	Filesystem      FilesystemManifest        `yaml:"filesystem"`
+	Namespaces      []NamespaceManifestEntry  `yaml:"namespaces"`
+	ExternalRestore *ExternalRestoreConfig    `yaml:"externalRestore,omitempty"`
 }
 
 // NewCheckpointManifest assembles a CheckpointManifest from per-module builders.

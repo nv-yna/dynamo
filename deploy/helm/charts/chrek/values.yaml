@@ -123,10 +123,12 @@ rbac:
 # Dynamic values (NODE_NAME, RESTRICTED_NAMESPACE, etc.) still come from environment variables
 config:
   agent:
-    # How checkpoints are triggered: "http" or "watcher"
-    signalSource: "watcher"
-    # HTTP server address for health checks and API
+    # UDS socket path for the API server
+    socketPath: "/var/run/chrek/chrek.sock"
+    # TCP address for health checks (optional, for K8s probes)
     listenAddr: ":8080"
+    # Enable automatic pod watching alongside the UDS server
+    enableWatcher: false
 
   checkpoint:
     criu:
@@ -173,7 +175,3 @@ config:
         - "./.cache/huggingface"
       # Additional custom exclusions (application-specific)
       additionalExclusions: []
-
-  # NOTE: Restore configuration is NOT in this ConfigMap.
-  # Placeholder containers do not mount it. Restore defaults are hardcoded in Go.
-  # CRIU options for restore come from the saved checkpoint manifest (manifest.yaml).

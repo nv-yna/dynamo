@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	criu "github.com/checkpoint-restore/go-criu/v7"
-	criurpc "github.com/checkpoint-restore/go-criu/v7/rpc"
+	criu "github.com/checkpoint-restore/go-criu/v8"
+	criurpc "github.com/checkpoint-restore/go-criu/v8/rpc"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
