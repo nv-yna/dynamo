@@ -413,7 +413,7 @@ async def init(
                 logging.info("TensorRT-LLM MetricsCollector initialized")
 
                 # Register TRT-LLM metrics (TRT-LLM natively outputs trtllm_* metrics after traffic)
-                # Auto-label injection (USE_AUTO_LABELS=True): hierarchy labels are added automatically
+                # Auto-label injection: hierarchy labels are added automatically
                 register_engine_metrics_callback(
                     endpoint=endpoint,
                     registry=REGISTRY,

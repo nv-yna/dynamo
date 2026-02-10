@@ -271,7 +271,7 @@ def setup_metrics_collection(config: Config, generate_endpoint, logger):
     separate registry for multiprocess collection and register callbacks to both
     registries to ensure all metrics (vllm, lmcache, dynamo_component) are collected.
 
-    Auto-label injection (USE_AUTO_LABELS=True in prometheus.py):
+    Auto-label injection:
         Hierarchy labels (dynamo_namespace, dynamo_component, dynamo_endpoint) are automatically
         injected into engine metrics to align Python metrics with Rust auto-labels.
         Additional labels can be provided via inject_labels parameter.

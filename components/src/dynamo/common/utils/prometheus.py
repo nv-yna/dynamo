@@ -25,13 +25,11 @@ from dynamo.prometheus_names import kvstats, labels, model_info, name_prefix
 if TYPE_CHECKING:
     from prometheus_client import CollectorRegistry
 
-# Auto-label injection control (aligns Python engine metrics with Rust auto-labels)
-# When True, automatically injects dynamo_namespace, dynamo_component, dynamo_endpoint labels
+# Auto-label injection: always injects dynamo_namespace, dynamo_component, dynamo_endpoint labels
 # into engine metrics based on the endpoint hierarchy.
 #
-# Rust counterpart: lib/runtime/src/metrics.rs USE_AUTO_LABELS constant and create_metric() function (lines 227-266)
-# Label constants defined in: lib/runtime/src/metrics/prometheus_names.rs labels module (lines 73-83)
-USE_AUTO_LABELS = True
+# Rust counterpart: lib/runtime/src/metrics.rs create_metric() function
+# Label constants defined in: lib/runtime/src/metrics/prometheus_names.rs labels module
 
 
 def register_engine_metrics_callback(
@@ -39,7 +37,6 @@ def register_engine_metrics_callback(
     registry: "CollectorRegistry",
     metric_prefix_filters: Optional[list[str]] = None,
     exclude_prefixes: Optional[list[str]] = None,
-    add_prefix: Optional[str] = None,
     inject_custom_labels: Optional[dict[str, str]] = None,
     namespace_name: Optional[str] = None,
     component_name: Optional[str] = None,
@@ -52,13 +49,12 @@ def register_engine_metrics_callback(
     This registers a callback that is invoked when /metrics is scraped, passing through
     engine-specific metrics alongside Dynamo runtime metrics.
 
-    When USE_AUTO_LABELS is True, automatically injects dynamo_namespace, dynamo_component,
-    dynamo_endpoint, model, and model_name labels. These can be provided explicitly via
-    namespace_name/component_name/endpoint_name/model_name parameters.
+    Automatically injects dynamo_namespace, dynamo_component, dynamo_endpoint, model,
+    and model_name labels when namespace_name and component_name are provided.
 
     Label Precedence (highest to lowest):
     1. Existing labels from source metrics - never changed, never overwritten
-    2. Auto-injected labels (dynamo_*, model*) - added by Dynamo when USE_AUTO_LABELS=True
+    2. Auto-injected labels (dynamo_*, model*) - added by Dynamo automatically
     3. Custom labels (inject_custom_labels) - user-provided, lowest precedence
 
     If inject_custom_labels contains keys that conflict with auto-injected labels,
@@ -69,12 +65,11 @@ def register_engine_metrics_callback(
         registry: Prometheus registry to collect from (e.g., REGISTRY or CollectorRegistry)
         metric_prefix_filters: List of prefixes to filter metrics (e.g., ["vllm:"], ["vllm:", "lmcache:"], or None for no filtering)
         exclude_prefixes: List of metric name prefixes to exclude (e.g., ["python_", "process_"])
-        add_prefix: Prefix to add to remaining metrics (e.g., "trtllm_")
-        inject_custom_labels: Optional dict of custom labels to inject (e.g. {"gpu_type": "H100"}).
+        inject_custom_labels: Optional dict of custom labels to inject (e.g. {"lora_adapter": "my-lora"}).
                       Injected at collection time without modifying source metrics.
                       Reserved labels (le, quantile) will raise ValueError.
-                      When USE_AUTO_LABELS is True, auto-labels (dynamo_namespace, dynamo_component,
-                      dynamo_endpoint, model, model_name) are added automatically and should not be in inject_custom_labels.
+                      Auto-labels (dynamo_namespace, dynamo_component, dynamo_endpoint, model,
+                      model_name) are added automatically and should not be in inject_custom_labels.
         namespace_name: Explicit namespace name for auto-labels (from config.namespace)
         component_name: Explicit component name for auto-labels (from config.component)
         endpoint_name: Explicit endpoint name for auto-labels (from config.endpoint, defaults to "generate")
@@ -82,7 +77,7 @@ def register_engine_metrics_callback(
 
     Example:
         from prometheus_client import REGISTRY
-        # Auto-labels enabled (USE_AUTO_LABELS=True): automatically adds hierarchy labels
+        # Auto-labels: automatically adds hierarchy labels
         register_engine_metrics_callback(
             generate_endpoint, REGISTRY,
             metric_prefix_filters=["vllm:"],
@@ -101,20 +96,20 @@ def register_engine_metrics_callback(
             metric_prefix_filters=["trtllm_"],
         )
 
-        # Inject additional labels (auto-labels are added automatically if USE_AUTO_LABELS=True)
+        # Inject additional labels (auto-labels are added automatically)
         register_engine_metrics_callback(
             generate_endpoint, REGISTRY,
             metric_prefix_filters=["vllm:"],
-            inject_custom_labels={"gpu_type": "H100", "region": "us-west-2"}
+            inject_custom_labels={"lora_adapter": "my-lora"}
         )
     """
 
-    # Auto-inject hierarchy labels if enabled
+    # Auto-inject hierarchy labels
     final_inject_labels = inject_custom_labels.copy() if inject_custom_labels else {}
 
-    if USE_AUTO_LABELS and (namespace_name and component_name):
+    if namespace_name and component_name:
         # Extract hierarchy information
-        # Mirrors Rust auto-label injection in lib/runtime/src/metrics.rs create_metric() (lines 227-266)
+        # Mirrors Rust auto-label injection in lib/runtime/src/metrics.rs create_metric()
         endpoint_name_final = endpoint_name or "generate"
 
         # Add auto-labels using constants from prometheus_names.labels
@@ -138,8 +133,8 @@ def register_engine_metrics_callback(
             for key in auto_labels:
                 if key in inject_custom_labels:
                     logging.warning(
-                        f"Custom label '{key}' conflicts with auto-injected label (USE_AUTO_LABELS=True). "
-                        f"Auto-injected value will take precedence. Custom value '{inject_custom_labels[key]}' will be ignored."
+                        f"Custom label '{key}' conflicts with auto-injected label. "
+                        f"Auto-injected value takes precedence. Custom value '{inject_custom_labels[key]}' ignored."
                     )
 
         # Merge labels with correct precedence:
@@ -159,7 +154,6 @@ def register_engine_metrics_callback(
             registry,
             metric_prefix_filters=metric_prefix_filters,
             exclude_prefixes=exclude_prefixes,
-            add_prefix=add_prefix,
             inject_custom_labels=final_inject_labels if final_inject_labels else None,
         )
         return result
@@ -190,17 +184,10 @@ def _compile_include_pattern(metric_prefixes: tuple[str, ...]) -> Pattern:
     return re.compile(rf"^(# (HELP|TYPE) )?({prefixes_regex})")
 
 
-@lru_cache(maxsize=128)
-def _compile_help_type_pattern() -> Pattern:
-    """Compile and cache regex for extracting metric names from HELP/TYPE comment lines."""
-    return re.compile(r"^# (HELP|TYPE) (\S+)(.*)$")
-
-
 def get_prometheus_expfmt(
     registry,
     metric_prefix_filters: Optional[list[str]] = None,
     exclude_prefixes: Optional[list[str]] = None,
-    add_prefix: Optional[str] = None,
     inject_custom_labels: Optional[dict[str, str]] = None,
 ) -> str:
     """
@@ -221,9 +208,8 @@ def get_prometheus_expfmt(
         metric_prefix_filters: Optional list of prefixes to filter displayed metrics (e.g., ["vllm:"] or ["vllm:", "lmcache:"]).
                              If None, returns all metrics. Supports single string or list of strings. (default: None)
         exclude_prefixes: List of metric name prefixes to exclude (e.g., ["python_", "process_"])
-        add_prefix: Prefix to add to remaining metrics (e.g., "custom:")
         inject_custom_labels: Optional dict of custom labels to inject at collection time.
-                      Example: {"gpu_type": "H100", "region": "us-west-2"}
+                      Example: {"lora_adapter": "my-lora"}
                       Reserved labels (le, quantile) will raise ValueError.
 
                       Label Precedence (highest to lowest):
@@ -244,7 +230,7 @@ def get_prometheus_expfmt(
         # Inject labels (custom labels, not auto-injected ones)
         get_prometheus_expfmt(
             registry, metric_prefix_filters=["vllm:"],
-            inject_custom_labels={"gpu_type": "H100", "region": "us-west-2"}
+            inject_custom_labels={"lora_adapter": "my-lora"}
         )
     """
     from prometheus_client import CollectorRegistry, generate_latest
@@ -271,7 +257,7 @@ def get_prometheus_expfmt(
         # Generate metrics in Prometheus text format
         metrics_text = generate_latest(registry).decode("utf-8")
 
-        if metric_prefix_filters or exclude_prefixes or add_prefix:
+        if metric_prefix_filters or exclude_prefixes:
             lines = []
 
             # Get cached compiled patterns
@@ -285,9 +271,6 @@ def get_prometheus_expfmt(
                 filter_tuple: tuple[str, ...] = tuple(metric_prefix_filters)
                 include_pattern = _compile_include_pattern(filter_tuple)
 
-            # Get cached HELP/TYPE pattern
-            help_type_pattern = _compile_help_type_pattern()
-
             for line in metrics_text.split("\n"):
                 if not line.strip():
                     continue
@@ -299,52 +282,6 @@ def get_prometheus_expfmt(
                 # Apply include filter if specified
                 if include_pattern and not include_pattern.match(line):
                     continue
-
-                # Apply prefix transformation if needed
-                if add_prefix:
-                    # Handle HELP/TYPE comments
-                    if line.startswith("# HELP ") or line.startswith("# TYPE "):
-                        match = help_type_pattern.match(line)
-                        if match:
-                            comment_type, metric_name, rest = match.groups()
-                            # Remove existing prefix if present
-                            if metric_prefix_filters:
-                                for prefix in metric_prefix_filters:
-                                    if metric_name.startswith(prefix):
-                                        metric_name = metric_name.removeprefix(prefix)
-                                        break
-                            # Only add prefix if it doesn't already exist
-                            if not metric_name.startswith(add_prefix):
-                                metric_name = add_prefix + metric_name
-                            line = f"# {comment_type} {metric_name}{rest}"
-                    # Handle metric lines
-                    elif line and not line.startswith("#"):
-                        # Extract metric name (first token)
-                        parts = line.split(None, 1)
-                        if parts:
-                            metric_name_part = parts[0]
-                            rest_of_line = parts[1] if len(parts) > 1 else ""
-
-                            # Remove existing prefix if present
-                            if metric_prefix_filters:
-                                for prefix in metric_prefix_filters:
-                                    if metric_name_part.startswith(prefix):
-                                        metric_name_part = (
-                                            metric_name_part.removeprefix(prefix)
-                                        )
-                                        break
-
-                            # Only add prefix if it doesn't already exist
-                            if not metric_name_part.startswith(add_prefix):
-                                metric_name_part = add_prefix + metric_name_part
-
-                            # Reconstruct line
-                            line = metric_name_part + (
-                                " " + rest_of_line if rest_of_line else ""
-                            )
-                        else:
-                            # Empty line or just whitespace, skip prefix addition
-                            pass
 
                 lines.append(line)
 

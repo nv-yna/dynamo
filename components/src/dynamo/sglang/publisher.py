@@ -315,7 +315,7 @@ def setup_prometheus_registry(
     multiprocess.MultiProcessCollector(registry)
 
     # Register callback for SGLang metrics (sglang:* prefixed)
-    # Auto-label injection (USE_AUTO_LABELS=True): hierarchy labels are added automatically
+    # Auto-label injection: hierarchy labels are added automatically
     register_engine_metrics_callback(
         endpoint=generate_endpoint,
         registry=registry,
