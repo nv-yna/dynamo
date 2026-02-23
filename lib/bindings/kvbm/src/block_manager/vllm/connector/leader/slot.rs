@@ -2132,4 +2132,152 @@ mod connector_tests {
 
         assert_eq!(slot.num_device_blocks_allocated(), 4);
     }
+
+    // ---------------------------------------------------------------
+    // Test 8: TRT-LLM chunked prefill — chunk 1 dedup + chunk 2 with num_computed_tokens
+    // (Pattern #6: the exact TRT-LLM multi-chunk calling sequence)
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_trtllm_chunked_prefill_dedup_and_offload() {
+        // 192 tokens = 6 blocks. Chunk size = 128 tokens (4 blocks).
+        // Chunk 1: new_request with ALL 6 blocks (dedup fires), schedules 128 tokens → offloads blocks 0-3
+        // Chunk 2: cached_request with 0 blocks, num_computed=128, schedules 64 tokens → offloads blocks 4-5
+        let num_tokens = 192;
+        let (mut slot, mut rx) = create_test_slot(num_tokens, 0);
+        let all_blocks = block_ids(100, 6);
+
+        // All blocks allocated upfront (TRT-LLM pattern)
+        slot.append_mutable_device_blocks(&all_blocks).unwrap();
+        assert_eq!(slot.num_device_blocks_allocated(), 6);
+
+        // Chunk 1: new_request — passes ALL block_ids (dedup guard fires)
+        slot.apply_scheduler_output(&[], &all_blocks, 0, 128, None)
+            .unwrap();
+        assert_eq!(slot.num_device_blocks_allocated(), 6); // dedup prevented doubling
+        let offloads_1 = drain_offload_block_ids(&mut rx);
+        assert_eq!(offloads_1.len(), 1);
+        assert_eq!(offloads_1[0], vec![100, 101, 102, 103]); // 128/32 = 4 blocks
+
+        // Chunk 2: cached_request — 0 new blocks, num_computed_tokens=128
+        slot.apply_scheduler_output(&[], &[], 128, 64, None)
+            .unwrap();
+        let offloads_2 = drain_offload_block_ids(&mut rx);
+        assert_eq!(offloads_2.len(), 1);
+        assert_eq!(offloads_2[0], vec![104, 105]); // remaining 2 blocks
+    }
+
+    // ---------------------------------------------------------------
+    // Test 9: All-high priority — threshold doesn't block anything
+    // (Pattern #8)
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_priority_all_high_offloads_everything() {
+        let num_tokens = 96; // 3 blocks
+        let (mut slot, mut rx) = create_test_slot(num_tokens, 30);
+        let blocks = block_ids(100, 3);
+        let priorities: Vec<u32> = vec![80, 80, 80]; // all above threshold
+
+        slot.append_mutable_device_blocks(&blocks).unwrap();
+        slot.apply_scheduler_output(&[], &blocks, 0, num_tokens, Some(&priorities))
+            .unwrap();
+
+        let offloads = drain_offload_block_ids(&mut rx);
+        assert_eq!(offloads.len(), 1);
+        assert_eq!(offloads[0], vec![100, 101, 102]); // all 3 offloaded
+    }
+
+    // ---------------------------------------------------------------
+    // Test 10: Chunked prefill with stored priorities — all high
+    // (Pattern #11: chunk 1 stores priorities, chunk 2 looks them up)
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_stored_priorities_chunked_all_high() {
+        // 192 tokens = 6 blocks. Chunk size = 128 (4 blocks evaluated in chunk 1).
+        // Chunk 1: priorities=[80]*6 for all blocks → stores them, offloads blocks 0-3
+        // Chunk 2: priorities=None → uses stored priorities for blocks 4-5 → offloads both
+        let num_tokens = 192;
+        let (mut slot, mut rx) = create_test_slot(num_tokens, 30);
+        let all_blocks = block_ids(100, 6);
+        let priorities: Vec<u32> = vec![80; 6];
+
+        slot.append_mutable_device_blocks(&all_blocks).unwrap();
+
+        // Chunk 1: new_request with all blocks + priorities (TRT-LLM pattern)
+        slot.apply_scheduler_output(&[], &all_blocks, 0, 128, Some(&priorities))
+            .unwrap();
+        let offloads_1 = drain_offload_block_ids(&mut rx);
+        assert_eq!(offloads_1.len(), 1);
+        assert_eq!(offloads_1[0], vec![100, 101, 102, 103]);
+
+        // Chunk 2: cached_request — no blocks, no priorities
+        // Stored priorities from chunk 1 should be used for blocks 104, 105
+        slot.apply_scheduler_output(&[], &[], 128, 64, None)
+            .unwrap();
+        let offloads_2 = drain_offload_block_ids(&mut rx);
+        assert_eq!(offloads_2.len(), 1);
+        assert_eq!(offloads_2[0], vec![104, 105]); // stored priorities = 80 >= 30
+    }
+
+    // ---------------------------------------------------------------
+    // Test 11: Chunked prefill with stored priorities — mixed, termination in chunk 2
+    // (Pattern #12: Fix 2's exact scenario)
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_stored_priorities_chunked_mixed_terminates_in_chunk2() {
+        // 192 tokens = 6 blocks. Chunk size = 128 (4 blocks in chunk 1).
+        // Priorities: blocks 0-3 = 80 (high), blocks 4-5 = 10 (low)
+        // Chunk 1: evaluates blocks 0-3, all priority 80 → offloads all 4
+        // Chunk 2: evaluates blocks 4-5, stored priority 10 < 30 → offloads 0, terminates
+        let num_tokens = 192;
+        let (mut slot, mut rx) = create_test_slot(num_tokens, 30);
+        let all_blocks = block_ids(100, 6);
+        let priorities: Vec<u32> = vec![80, 80, 80, 80, 10, 10];
+
+        slot.append_mutable_device_blocks(&all_blocks).unwrap();
+
+        // Chunk 1: all blocks + priorities
+        slot.apply_scheduler_output(&[], &all_blocks, 0, 128, Some(&priorities))
+            .unwrap();
+        let offloads_1 = drain_offload_block_ids(&mut rx);
+        assert_eq!(offloads_1.len(), 1);
+        assert_eq!(offloads_1[0], vec![100, 101, 102, 103]); // all 4 high-prio
+
+        // Chunk 2: no blocks, no priorities — uses stored priorities
+        // Blocks 104,105 have stored priority 10 < threshold 30 → terminate immediately
+        slot.apply_scheduler_output(&[], &[], 128, 64, None)
+            .unwrap();
+        let offloads_2 = drain_offload_block_ids(&mut rx);
+        assert!(
+            offloads_2.is_empty(),
+            "blocks 4-5 have stored priority 10 < threshold 30, should not offload"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Test 12: Multiple sequential requests — independent slots
+    // (Pattern #13)
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_multiple_sequential_requests() {
+        // Simulates 3 sequential requests, each with its own slot.
+        // Verifies no cross-contamination between slots.
+        for i in 0..3 {
+            let num_tokens = 64 * (i + 1); // 64, 128, 192
+            let num_blocks = num_tokens / BLOCK_SIZE;
+            let (mut slot, mut rx) = create_test_slot(num_tokens, 0);
+            let blocks = block_ids(100 + i * 100, num_blocks);
+
+            slot.append_mutable_device_blocks(&blocks).unwrap();
+            slot.apply_scheduler_output(&[], &blocks, 0, num_tokens, None)
+                .unwrap();
+
+            // Dedup: still exactly num_blocks
+            assert_eq!(slot.num_device_blocks_allocated(), num_blocks);
+
+            // Correct offload
+            let offloads = drain_offload_block_ids(&mut rx);
+            assert_eq!(offloads.len(), 1);
+            assert_eq!(offloads[0], blocks);
+        }
+    }
 }
