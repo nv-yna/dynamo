@@ -1,0 +1,9 @@
+The user wants to calculate 47 * 83 with 2 decimal places and no scientific notation. Let me do this calculation.</think>
+
+<｜DSML｜tool_calls>
+<｜DSML｜invoke name="calculate">
+<｜DSML｜parameter name="expression" string="true">47 * 83</｜DSML｜parameter>
+<｜DSML｜parameter name="precision" string="false">2</｜DSML｜parameter>
+<｜DSML｜parameter name="scientific" string="false">false</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>

@@ -1,0 +1,6 @@
+{
+  "model": "deepseek-ai/DeepSeek-V4-Flash",
+  "prompt": "<｜begin▁of▁sentence｜><｜User｜>What's 47 * 83? Show your work briefly.<｜Assistant｜><think>",
+  "max_tokens": 256,
+  "temperature": 0.0
+}

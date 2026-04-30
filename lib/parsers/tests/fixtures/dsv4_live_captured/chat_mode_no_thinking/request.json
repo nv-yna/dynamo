@@ -1,0 +1,6 @@
+{
+  "model": "deepseek-ai/DeepSeek-V4-Flash",
+  "prompt": "<｜begin▁of▁sentence｜><｜User｜>Reply with the single word: pong.<｜Assistant｜></think>",
+  "max_tokens": 32,
+  "temperature": 0.0
+}

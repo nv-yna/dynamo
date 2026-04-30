@@ -1,0 +1,14 @@
+{
+  "role": "assistant",
+  "content": "",
+  "reasoning_content": "The user wants to calculate 47 * 83 with 2 decimal places and no scientific notation. Let me do this calculation.",
+  "tool_calls": [
+    {
+      "type": "function",
+      "function": {
+        "name": "calculate",
+        "arguments": "{\"expression\": \"47 * 83\", \"precision\": 2, \"scientific\": false}"
+      }
+    }
+  ]
+}

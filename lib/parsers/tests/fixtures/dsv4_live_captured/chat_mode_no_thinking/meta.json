@@ -1,0 +1,14 @@
+{
+  "probe_id": "chat_mode_no_thinking",
+  "description": "Chat mode (non-thinking) with no tools; tests baseline content emission.",
+  "thinking_mode": "chat",
+  "finish_reason": "stop",
+  "model": "deepseek-ai/DeepSeek-V4-Flash",
+  "endpoint": "yna-trtllm-mewtwo:/v1/completions (no --tool_call_parser, no --reasoning_parser)",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Reply with the single word: pong."
+    }
+  ]
+}

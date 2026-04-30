@@ -1,0 +1,6 @@
+{
+  "role": "assistant",
+  "content": "The weather in New York City is currently **sunny** with a temperature of **72°F**. Perfect day to be out and about! ☀️",
+  "reasoning_content": "The user asked about the weather in NYC. The tool returned \"sunny, 72F\". Let me provide a friendly response.",
+  "tool_calls": []
+}

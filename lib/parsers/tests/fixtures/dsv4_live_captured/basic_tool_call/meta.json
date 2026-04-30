@@ -1,0 +1,38 @@
+{
+  "probe_id": "basic_tool_call",
+  "description": "Single tool call with one string parameter.",
+  "thinking_mode": "thinking",
+  "finish_reason": "stop",
+  "model": "deepseek-ai/DeepSeek-V4-Flash",
+  "endpoint": "yna-trtllm-mewtwo:/v1/completions (no --tool_call_parser, no --reasoning_parser)",
+  "messages": [
+    {
+      "role": "system",
+      "content": "",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": "What's the weather in London?"
+    }
+  ]
+}

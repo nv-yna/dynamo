@@ -1,0 +1,46 @@
+{
+  "probe_id": "multi_param_tool",
+  "description": "Single tool call with mixed-type parameters (string, integer, boolean).",
+  "thinking_mode": "thinking",
+  "finish_reason": "stop",
+  "model": "deepseek-ai/DeepSeek-V4-Flash",
+  "endpoint": "yna-trtllm-mewtwo:/v1/completions (no --tool_call_parser, no --reasoning_parser)",
+  "messages": [
+    {
+      "role": "system",
+      "content": "",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "calculate",
+            "description": "Evaluate an arithmetic expression.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "expression": {
+                  "type": "string"
+                },
+                "precision": {
+                  "type": "integer",
+                  "description": "Decimal places to round to."
+                },
+                "scientific": {
+                  "type": "boolean",
+                  "description": "Use scientific notation."
+                }
+              },
+              "required": [
+                "expression"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": "Calculate 47 * 83 with 2 decimal places, no scientific notation."
+    }
+  ]
+}

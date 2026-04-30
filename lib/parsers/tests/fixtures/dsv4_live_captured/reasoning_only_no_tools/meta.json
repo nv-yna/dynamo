@@ -1,0 +1,14 @@
+{
+  "probe_id": "reasoning_only_no_tools",
+  "description": "Thinking mode without tools; tests reasoning_content vs content split.",
+  "thinking_mode": "thinking",
+  "finish_reason": "stop",
+  "model": "deepseek-ai/DeepSeek-V4-Flash",
+  "endpoint": "yna-trtllm-mewtwo:/v1/completions (no --tool_call_parser, no --reasoning_parser)",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What's 47 * 83? Show your work briefly."
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+The user is asking about the weather in London. I can use the get_weather tool to answer this.</think>
+
+<｜DSML｜tool_calls>
+<｜DSML｜invoke name="get_weather">
+<｜DSML｜parameter name="city" string="true">London</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>

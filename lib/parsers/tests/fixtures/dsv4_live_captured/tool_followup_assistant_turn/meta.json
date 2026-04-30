@@ -1,0 +1,56 @@
+{
+  "probe_id": "tool_followup_assistant_turn",
+  "description": "Tool result followed by user/assistant generation; tests P1.7-class reasoning gating from the decoder side.",
+  "thinking_mode": "thinking",
+  "finish_reason": "stop",
+  "model": "deepseek-ai/DeepSeek-V4-Flash",
+  "endpoint": "yna-trtllm-mewtwo:/v1/completions (no --tool_call_parser, no --reasoning_parser)",
+  "messages": [
+    {
+      "role": "system",
+      "content": "",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": "What's the weather in NYC?"
+    },
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"city\": \"NYC\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "sunny, 72F"
+    }
+  ]
+}

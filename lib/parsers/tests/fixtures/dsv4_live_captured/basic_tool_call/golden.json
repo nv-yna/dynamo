@@ -1,0 +1,14 @@
+{
+  "role": "assistant",
+  "content": "",
+  "reasoning_content": "The user is asking about the weather in London. I can use the get_weather tool to answer this.",
+  "tool_calls": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"London\"}"
+      }
+    }
+  ]
+}
