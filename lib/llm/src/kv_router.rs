@@ -519,6 +519,58 @@ where
             );
         }
 
+        // Per-op BUSY-time attribution (DYN_STALL_OP_TRACE=1): WARN when a synchronous frontend
+        // request-path op exceeds DYN_STALL_OP_WARN_MS (default 50ms) of on-event-loop busy time, so a
+        // residual frontend event-loop stall (after the tokenize offload) is attributed to a NAMED op
+        // (block_hash / seq_hash / indexer / schedule), not inferred. block/seq-hash deltas are pure
+        // busy (no await between `start` and here); `indexer` is busy for the inline radix path;
+        // `schedule` is wall (includes the actor oneshot) so treat it as an upper bound. Target
+        // dynamo_stall_op correlates by timestamp with the dynamo_stall canary. Zero-cost when off.
+        {
+            static STALL_OP_WARN_MS: std::sync::OnceLock<Option<u128>> = std::sync::OnceLock::new();
+            let warn = *STALL_OP_WARN_MS.get_or_init(|| {
+                if std::env::var("DYN_STALL_OP_TRACE")
+                    .ok()
+                    .is_some_and(|v| v == "1" || v == "true")
+                {
+                    Some(
+                        std::env::var("DYN_STALL_OP_WARN_MS")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(50u128),
+                    )
+                } else {
+                    None
+                }
+            });
+            if let Some(warn_ms) = warn {
+                let ops = [
+                    ("block_hash", hash_elapsed.as_millis()),
+                    (
+                        "seq_hash",
+                        seq_hash_elapsed.saturating_sub(hash_elapsed).as_millis(),
+                    ),
+                    ("indexer", indexer_duration.as_millis()),
+                    (
+                        "schedule",
+                        total_elapsed.saturating_sub(find_matches_elapsed).as_millis(),
+                    ),
+                ];
+                for (op, ms) in ops {
+                    if ms >= warn_ms {
+                        tracing::warn!(
+                            target: "dynamo_stall_op",
+                            op = op,
+                            busy_ms = ms as u64,
+                            isl_tokens = isl_tokens,
+                            num_blocks = num_blocks,
+                            "frontend request-path op busy on event loop"
+                        );
+                    }
+                }
+            }
+        }
+
         // Observe per-request shared cache metrics.
         if let Some(hits) = sc_hits_for_metrics
             && let Some(m) = metrics::RouterRequestMetrics::get()
