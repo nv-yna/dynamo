@@ -951,14 +951,21 @@ where
         instance_id: u64,
     ) -> anyhow::Result<ManyOut<U>> {
         let stream = match stream {
-            Ok(stream) => stream,
+            Ok(stream) => {
+                // Successful dispatch (worker ACKed) → reset its consecutive-failure
+                // counter so only consecutive failures accumulate toward inhibit.
+                if self.fault_detection_enabled {
+                    self.client.report_instance_recovered(instance_id);
+                }
+                stream
+            }
             Err(err) => {
                 if self.fault_detection_enabled {
                     if is_inhibited(err.as_ref()) {
                         tracing::debug!(
                             "Reporting instance {instance_id} down due to error: {err}"
                         );
-                        self.client.report_instance_down(instance_id);
+                        self.client.report_instance_failure(instance_id);
                     } else if match_error_chain(err.as_ref(), &[ErrorType::ResourceExhausted], &[])
                     {
                         // Backpressure: worker said "my queue is full,
@@ -990,7 +997,7 @@ where
                 tracing::debug!(
                     "Reporting instance {instance_id} down due to migratable error: {err}"
                 );
-                client.report_instance_down(instance_id);
+                client.report_instance_failure(instance_id);
             }
             res
         });
@@ -1014,7 +1021,7 @@ where
                                     timeout_secs = timeout.as_secs(),
                                     "backend response inactivity timeout — quarantining worker"
                                 );
-                                client_for_timeout.report_instance_down(instance_id);
+                                client_for_timeout.report_instance_failure(instance_id);
                                 yield U::from_err(
                                     crate::error::DynamoError::builder()
                                         .error_type(crate::error::ErrorType::ResponseTimeout)
