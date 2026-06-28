@@ -573,6 +573,7 @@ impl<
     /// Run the full scheduling pipeline for a single request:
     /// compute projected load -> select worker -> book tracked state -> respond.
     fn admit_one(&self, mut request: SchedulingRequest, decay_now: Instant) {
+        let op_start = Instant::now();
         request.worker_loads = self
             .slots
             .project_worker_loads(request.token_seq.as_deref(), decay_now);
@@ -587,6 +588,41 @@ impl<
             self.selector
                 .select_worker(&workers, &request, eligibility, self.block_size)
         };
+
+        // Per-op BUSY-time attribution (DYN_STALL_OP_TRACE=1): project_worker_loads + select_worker run
+        // synchronously on the scheduler-actor task (which lives on the frontend runtime), so this is
+        // on-event-loop busy time (no await above). WARN past DYN_STALL_OP_WARN_MS so a residual
+        // frontend stall can be attributed to scheduler admission vs request-path hashing. Zero-cost off.
+        {
+            static STALL_OP_WARN_MS: std::sync::OnceLock<Option<u128>> = std::sync::OnceLock::new();
+            let warn = *STALL_OP_WARN_MS.get_or_init(|| {
+                if std::env::var("DYN_STALL_OP_TRACE")
+                    .ok()
+                    .is_some_and(|v| v == "1" || v == "true")
+                {
+                    Some(
+                        std::env::var("DYN_STALL_OP_WARN_MS")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(50u128),
+                    )
+                } else {
+                    None
+                }
+            });
+            if let Some(warn_ms) = warn {
+                let ms = op_start.elapsed().as_millis();
+                if ms >= warn_ms {
+                    tracing::warn!(
+                        target: "dynamo_stall_op",
+                        op = "admit_select",
+                        busy_ms = ms as u64,
+                        isl_tokens = request.isl_tokens,
+                        "scheduler admission busy on actor task"
+                    );
+                }
+            }
+        }
 
         let selection = match selection {
             Ok(s) => s,
