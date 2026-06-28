@@ -1779,9 +1779,52 @@ impl OpenAIPreprocessor {
             prompt.to_string()
         };
         let tokenizer = self.tokenizer.clone();
-        let encoding = tokio::task::spawn_blocking(move || tokenizer.encode(&owned)).await??;
+        // Time the encode INSIDE the blocking task (after it is actually scheduled) so we can split
+        // total offload latency into pool-queue-wait (submit->run) vs encode (run->done). This
+        // resolves whether the receive->dispatch TTFT gap is the spawn_blocking POOL QUEUE (codex's
+        // hypothesis) or downstream router-queue (per-log hypothesis).
+        let (encoding, enc_dur): (Encoding, std::time::Duration) =
+            tokio::task::spawn_blocking(move || {
+                let run = std::time::Instant::now();
+                tokenizer.encode(&owned).map(|e| (e, run.elapsed()))
+            })
+            .await??;
+        let total = encode_start.elapsed();
         if let Some(t) = tracker {
-            t.record_tokenize_latency(encode_start.elapsed());
+            t.record_tokenize_latency(total);
+        }
+        // Per-op attribution (DYN_STALL_OP_TRACE=1): op=tokenize busy_ms = pool_wait + encode.
+        // pool_wait = total - encode = how long the request waited for a free blocking-pool thread.
+        {
+            static STALL_OP_WARN_MS: std::sync::OnceLock<Option<u128>> = std::sync::OnceLock::new();
+            let warn = *STALL_OP_WARN_MS.get_or_init(|| {
+                if std::env::var("DYN_STALL_OP_TRACE")
+                    .ok()
+                    .is_some_and(|v| v == "1" || v == "true")
+                {
+                    Some(
+                        std::env::var("DYN_STALL_OP_WARN_MS")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(50u128),
+                    )
+                } else {
+                    None
+                }
+            });
+            if let Some(warn_ms) = warn {
+                let total_ms = total.as_millis();
+                if total_ms >= warn_ms {
+                    tracing::warn!(
+                        target: "dynamo_stall_op",
+                        op = "tokenize",
+                        busy_ms = total_ms as u64,
+                        pool_wait_ms = total.saturating_sub(enc_dur).as_millis() as u64,
+                        encode_ms = enc_dur.as_millis() as u64,
+                        "tokenize offload latency (busy_ms = pool_wait + encode)"
+                    );
+                }
+            }
         }
         Ok(encoding)
     }
