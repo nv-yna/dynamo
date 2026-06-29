@@ -34,6 +34,28 @@ use inner::InnerPrefillRouter;
 pub use types::{PrefillError, PrefillQueryOutcome};
 use types::{PrefillOutcome, PrefillResolveDecision, build_decode_router_override};
 
+/// DYN_ENABLE_FAST_CANCELLATION: revert of PR #7489 ("prevent KV block leak from cancel
+/// during disagg KV transfer"). When set, the prefill request is re-linked as a child of
+/// the engine context so a client cancel/kill propagates and tears down the in-flight
+/// prefill + NIXL KV transfer ("fast cancellation"), and decode routing is aborted when the
+/// context is killed. Default off = post-#7489 behavior (prefill not linked; decode routing
+/// proceeds so KV transfer can complete + clean up). Diagnostic flag only — fast cancellation
+/// reintroduces the KV-block-leak risk #7489 fixed. Mirrors the Python `FAST_CANCELLATION`
+/// gate in trtllm `handler_base.py` for a faithful whole-PR revert.
+fn fast_cancellation_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("DYN_ENABLE_FAST_CANCELLATION")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// PrefillRouter is a forward-only operator that sits between Migration and the decode router.
 /// It optionally calls a prefill worker before routing to decode, extracting disaggregated_params
 /// from the prefill response and injecting them into the decode request.
@@ -181,6 +203,13 @@ impl
                     metadata.clone(),
                 );
 
+                // DYN_ENABLE_FAST_CANCELLATION (revert #7489): re-link prefill as a child of
+                // the engine context so cancel/kill propagates and interrupts the in-flight
+                // prefill + NIXL transfer (fast cancellation). Default off = not linked.
+                if fast_cancellation_enabled() {
+                    engine_ctx.link_child(prefill_context.context());
+                }
+
                 // Pass the phase barrier to the spawned task. It is released after routing
                 // completes so worker recording finishes before phase changes to Decode.
                 // The prefill trace (carrying a/b) is moved into the spawned task, which
@@ -263,6 +292,11 @@ impl
                     request_id.clone(),
                     metadata.clone(),
                 );
+                // DYN_ENABLE_FAST_CANCELLATION (revert #7489): re-link prefill as a child of
+                // the engine context so cancel/kill interrupts the in-flight prefill + transfer.
+                if fast_cancellation_enabled() {
+                    engine_ctx.link_child(prefill_context.context());
+                }
                 let completion = Self::execute_prefill(
                     self.prefill_router.get().cloned(),
                     prefill_context,
@@ -303,6 +337,11 @@ impl
                     request_id.clone(),
                     metadata.clone(),
                 );
+                // DYN_ENABLE_FAST_CANCELLATION (revert #7489): re-link prefill as a child of
+                // the engine context so cancel/kill interrupts the in-flight prefill + transfer.
+                if fast_cancellation_enabled() {
+                    engine_ctx.link_child(prefill_context.context());
+                }
 
                 // In Direct mode, pass preselected_worker so execute_prefill uses
                 // router.direct() instead of router.generate() (which bails in Direct mode).
@@ -335,7 +374,21 @@ impl
         // and leaks KV blocks permanently. The decode handler's
         // kv_transfer_complete_event guard will clean up after KV is received.
         // Log-only; decode routing must proceed for KV transfer cleanup.
+        //
+        // DYN_ENABLE_FAST_CANCELLATION (revert #7489): restore the pre-#7489 early-abort —
+        // when set, a stopped/killed context aborts decode routing immediately (fast
+        // cancellation; reintroduces the orphaned-transfer / block-leak risk #7489 fixed).
         if engine_ctx.is_stopped() || engine_ctx.is_killed() {
+            if fast_cancellation_enabled() {
+                tracing::debug!(
+                    "FAST_CANCELLATION: aborting decode entry, context {} stopped/killed",
+                    engine_ctx.id()
+                );
+                return Err(anyhow::anyhow!(
+                    "Context id {} is stopped or killed",
+                    engine_ctx.id()
+                ));
+            }
             tracing::debug!(
                 "Context {} killed/stopped after prefill, allowing decode routing for KV transfer",
                 engine_ctx.id()

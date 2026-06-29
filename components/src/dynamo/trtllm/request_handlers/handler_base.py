@@ -168,6 +168,21 @@ class TRTLLMEnginePauseController:
         manager.remap_all_vas()
 
 
+# DYN_ENABLE_FAST_CANCELLATION: revert of PR #7489 ("prevent KV block leak from
+# cancel during disagg KV transfer"). When set, the decode handler does NOT wrap
+# abort() in _DeferredAbort — i.e. cancellation fires immediately instead of being
+# deferred until the first decode token (KV-transfer-complete signal). This restores
+# the pre-#7489 "fast cancellation" behavior, reintroducing the KV-block-leak risk
+# that #7489 fixed. Diagnostic flag only — NOT a shippable default. Paired with the
+# Rust-side gate in prefill_router (same env var) for a faithful whole-PR revert.
+FAST_CANCELLATION = os.environ.get("DYN_ENABLE_FAST_CANCELLATION", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+
 class _Abortable(Protocol):
     """Structural type for objects that support abort(). Satisfied by both
     GenerationResult and _DeferredAbort."""
@@ -1159,10 +1174,14 @@ class HandlerBase(BaseGenerativeHandler):
             )
 
             # In disagg decode mode, wrap abort() to defer until first token
-            # (KV transfer complete).
+            # (KV transfer complete). DYN_ENABLE_FAST_CANCELLATION (revert of #7489)
+            # bypasses the wrapper so abort fires immediately (fast cancellation).
             abort_guard = (
                 _DeferredAbort(generation_result)
-                if self.disaggregation_mode == DisaggregationMode.DECODE
+                if (
+                    self.disaggregation_mode == DisaggregationMode.DECODE
+                    and not FAST_CANCELLATION
+                )
                 else None
             )
 
