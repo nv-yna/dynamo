@@ -357,6 +357,10 @@ pub struct ConnectionInfo {
     pub info: String,
 }
 
+/// Default number of messages buffered on a data-plane stream before the producer
+/// blocks. Referenced by the bounded-polling TCP server tests (PR #11008).
+pub const DEFAULT_SEND_BUFFER_COUNT: usize = 64;
+
 /// When registering a new TransportStream on the server, the caller specifies if the
 /// stream is a sender, receiver or both.
 ///

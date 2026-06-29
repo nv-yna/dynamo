@@ -6,10 +6,12 @@ use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr, TcpListener},
     os::fd::{AsFd, FromRawFd},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
-use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 /// Tombstone lifetime. Bridges the `register()` → `associate_instance()`
@@ -19,6 +21,7 @@ use tokio::time::Instant;
 const TOMBSTONE_TTL: Duration = Duration::from_secs(5);
 
 use bytes::Bytes;
+use dashmap::DashMap;
 use derive_builder::Builder;
 use futures::{SinkExt, StreamExt};
 use local_ip_address::{Error, list_afinet_netifas, local_ip, local_ipv6};
@@ -90,12 +93,12 @@ impl ServerOptions {
 pub struct TcpStreamServer {
     local_ip: String,
     local_port: u16,
-    state: Arc<Mutex<State>>,
+    registries: Arc<StreamRegistries>,
+    _handle: tokio::task::JoinHandle<Result<()>>,
 }
 
 // pub struct TcpStreamReceiver {
 //     address: TcpStreamConnectionInfo,
-//     state: Arc<Mutex<State>>,
 //     rx: mpsc::Receiver<ResponseType>,
 // }
 
@@ -103,11 +106,38 @@ pub struct TcpStreamServer {
 struct RequestedSendConnection {
     context: Arc<dyn AsyncEngineContext>,
     connection: oneshot::Sender<Result<StreamSender, String>>,
+    instance_gate: Option<Arc<InstanceGate>>,
+    /// Capacity of the per-stream mpsc buffer between the socket task and the
+    /// engine producer; carried from the registration [`StreamOptions`].
+    send_buffer_count: usize,
 }
 
 struct RequestedRecvConnection {
     context: Arc<dyn AsyncEngineContext>,
     connection: oneshot::Sender<Result<StreamReceiver, String>>,
+    instance_gate: Option<Arc<InstanceGate>>,
+    /// Capacity of the per-stream mpsc buffer between the socket task and the
+    /// engine consumer; carried from the registration [`StreamOptions`].
+    send_buffer_count: usize,
+}
+
+fn is_instance_cancelled(instance_gate: &Option<Arc<InstanceGate>>) -> bool {
+    instance_gate
+        .as_deref()
+        .is_some_and(InstanceGate::is_cancelled)
+}
+
+/// Build the per-stream data-plane mpsc channel that bridges the socket task
+/// and the engine producer/consumer. The capacity is driven by the
+/// registration options ([`StreamOptions::send_buffer_count`]) rather than a
+/// hard-coded constant; both `process_request_stream` and
+/// `process_response_stream` size their channel through this helper. See #10293.
+fn data_plane_channel<T>(send_buffer_count: usize) -> (mpsc::Sender<T>, mpsc::Receiver<T>) {
+    // `tokio::sync::mpsc::channel` panics on a capacity of 0. Now that the value
+    // is caller-configurable via `StreamOptions::send_buffer_count`, clamp to at
+    // least 1 so a misconfigured `0` degrades to a minimal buffer instead of
+    // panicking the connection handler task.
+    mpsc::channel(send_buffer_count.max(1))
 }
 
 // /// When registering a new TcpStream on the server, the registration method will return a [`Connections`] object.
@@ -127,28 +157,166 @@ struct RequestedRecvConnection {
 // }
 
 #[derive(Default)]
-struct State {
-    tx_subjects: HashMap<String, RequestedSendConnection>,
-    rx_subjects: HashMap<String, RequestedRecvConnection>,
-    /// subject UUID -> EndpointInstanceId. Full 4-field key isolates services
-    /// that share an endpoint name across namespaces/components.
-    subject_instance: HashMap<String, EndpointInstanceId>,
-    /// EndpointInstanceId -> tagged subject UUIDs, for batch cancellation on
-    /// removal. The `StreamType` tag tells `cancel_instance_streams` which
-    /// of `rx_subjects` / `tx_subjects` holds the registration so both halves
-    /// of a bidirectional session get dropped together.
-    instance_subjects: HashMap<EndpointInstanceId, HashSet<(StreamType, String)>>,
-    /// Tombstones (instance -> insertion time) close the
-    /// `cancel_instance_streams` vs `associate_instance` race; entries expire
-    /// after [`TOMBSTONE_TTL`].
-    removed_instances: HashMap<EndpointInstanceId, Instant>,
-    handle: Option<tokio::task::JoinHandle<Result<()>>>,
+struct InstanceGate {
+    cancelled: AtomicBool,
 }
 
-/// Drop tombstones older than [`TOMBSTONE_TTL`]. Called lazily on every
-/// `associate_instance` / `cancel_instance_streams` to bound the set size.
-fn prune_tombstones(tombstones: &mut HashMap<EndpointInstanceId, Instant>, now: Instant) {
-    tombstones.retain(|_, ts| now.saturating_duration_since(*ts) < TOMBSTONE_TTL);
+impl InstanceGate {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Default)]
+struct InstanceState {
+    gate: Arc<InstanceGate>,
+    subjects: HashSet<(StreamType, String)>,
+    removed_at: Option<Instant>,
+}
+
+#[derive(Default)]
+struct StreamRegistries {
+    tx_subjects: DashMap<String, RequestedSendConnection>,
+    rx_subjects: DashMap<String, RequestedRecvConnection>,
+    /// subject UUID -> EndpointInstanceId. Full 4-field key isolates services
+    /// that share an endpoint name across namespaces/components.
+    subject_instance: DashMap<String, EndpointInstanceId>,
+    /// Per-instance cancellation generation, tagged pending subjects, and
+    /// optional tombstone timestamp. A cancelled generation is never reset;
+    /// clear/re-add installs a fresh gate so stale registrations stay cancelled.
+    instance_states: DashMap<EndpointInstanceId, InstanceState>,
+}
+
+impl StreamRegistries {
+    /// Drop tombstones older than [`TOMBSTONE_TTL`]. Called from instance
+    /// cancellation, which is off the per-request association hot path.
+    fn prune_tombstones(&self, now: Instant) {
+        self.instance_states.retain(|_, state| {
+            state
+                .removed_at
+                .is_none_or(|ts| now.saturating_duration_since(ts) < TOMBSTONE_TTL)
+        });
+    }
+
+    fn insert_request_stream(&self, subject: String, connection: RequestedSendConnection) {
+        self.tx_subjects.insert(subject, connection);
+    }
+
+    fn insert_response_stream(&self, subject: String, connection: RequestedRecvConnection) {
+        self.rx_subjects.insert(subject, connection);
+    }
+
+    fn remove_request_stream(&self, subject: &str) -> Option<RequestedSendConnection> {
+        let conn = self.tx_subjects.remove(subject).map(|(_, conn)| conn);
+        self.remove_subject_tracking(StreamType::Request, subject);
+        conn
+    }
+
+    fn remove_response_stream(&self, subject: &str) -> Option<RequestedRecvConnection> {
+        let conn = self.rx_subjects.remove(subject).map(|(_, conn)| conn);
+        self.remove_subject_tracking(StreamType::Response, subject);
+        conn
+    }
+
+    /// Return the active cancellation generation for `id`. An expired
+    /// tombstone is refreshed in-place so association only touches this
+    /// instance's shard instead of scanning all instance states.
+    fn instance_gate(&self, id: &EndpointInstanceId, now: Instant) -> Arc<InstanceGate> {
+        let mut state = self.instance_states.entry(id.clone()).or_default();
+        if state
+            .removed_at
+            .is_some_and(|ts| now.saturating_duration_since(ts) >= TOMBSTONE_TTL)
+        {
+            *state = InstanceState::default();
+        }
+        state.gate.clone()
+    }
+
+    fn associate_subject(
+        &self,
+        kind: StreamType,
+        subject: &str,
+        id: &EndpointInstanceId,
+        gate: &Arc<InstanceGate>,
+    ) -> bool {
+        let found = match kind {
+            StreamType::Request => self.tx_subjects.get_mut(subject).map(|mut connection| {
+                connection.instance_gate = Some(gate.clone());
+            }),
+            StreamType::Response => self.rx_subjects.get_mut(subject).map(|mut connection| {
+                connection.instance_gate = Some(gate.clone());
+            }),
+        }
+        .is_some();
+
+        if !found {
+            return false;
+        }
+
+        self.subject_instance
+            .insert(subject.to_string(), id.clone());
+
+        let tracked = if let Some(mut state) = self.instance_states.get_mut(id) {
+            if Arc::ptr_eq(&state.gate, gate) {
+                state.subjects.insert((kind, subject.to_string()));
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !tracked {
+            self.subject_instance.remove(subject);
+        }
+        tracked
+    }
+
+    fn remove_subject_tracking(&self, kind: StreamType, subject: &str) {
+        let Some((_, id)) = self.subject_instance.remove(subject) else {
+            return;
+        };
+
+        let active_state_is_empty = if let Some(mut state) = self.instance_states.get_mut(&id) {
+            state.subjects.remove(&(kind, subject.to_string()));
+            state.subjects.is_empty() && state.removed_at.is_none()
+        } else {
+            false
+        };
+
+        if active_state_is_empty {
+            self.instance_states.remove_if(&id, |_, state| {
+                state.subjects.is_empty() && state.removed_at.is_none()
+            });
+        }
+    }
+
+    fn remove_registered_subject(&self, kind: StreamType, subject: &str) {
+        match kind {
+            StreamType::Request => {
+                self.tx_subjects.remove(subject);
+            }
+            StreamType::Response => {
+                self.rx_subjects.remove(subject);
+            }
+        }
+    }
+
+    fn cancel_registered_subject(&self, kind: StreamType, subject: &str) {
+        self.remove_registered_subject(kind.clone(), subject);
+        self.remove_subject_tracking(kind, subject);
+    }
+
+    /// Cancel a subject already removed from its instance's subject set.
+    fn cancel_drained_subject(&self, kind: StreamType, subject: &str) {
+        self.remove_registered_subject(kind, subject);
+        self.subject_instance.remove(subject);
+    }
 }
 
 impl TcpStreamServer {
@@ -205,9 +373,9 @@ impl TcpStreamServer {
             }
         };
 
-        let state = Arc::new(Mutex::new(State::default()));
+        let registries = Arc::new(StreamRegistries::default());
 
-        let local_port = Self::start(local_ip.clone(), options.port, state.clone())
+        let (local_port, handle) = Self::start(local_ip.clone(), options.port, registries.clone())
             .await
             .map_err(|e| {
                 PipelineError::Generic(format!("Failed to start TcpStreamServer: {}", e))
@@ -218,7 +386,8 @@ impl TcpStreamServer {
         Ok(Arc::new(Self {
             local_ip,
             local_port,
-            state,
+            registries,
+            _handle: handle,
         }))
     }
 
@@ -240,11 +409,18 @@ impl TcpStreamServer {
         send_subject: Option<&str>,
         id: &EndpointInstanceId,
     ) -> bool {
-        let mut state = self.state.lock().await;
         let now = Instant::now();
-        prune_tombstones(&mut state.removed_instances, now);
-        if state.removed_instances.contains_key(id) {
-            // Instance was already removed -- cancel immediately.
+        let gate = self.registries.instance_gate(id, now);
+
+        let recv_associated =
+            self.registries
+                .associate_subject(StreamType::Response, recv_subject, id, &gate);
+        let send_associated = send_subject.is_none_or(|subject| {
+            self.registries
+                .associate_subject(StreamType::Request, subject, id, &gate)
+        });
+
+        if !recv_associated || !send_associated || gate.is_cancelled() {
             tracing::warn!(
                 recv_subject,
                 send_subject,
@@ -252,24 +428,18 @@ impl TcpStreamServer {
                 component = %id.component,
                 endpoint = %id.endpoint,
                 instance_id = id.instance_id,
-                "Cancelling subject immediately: instance already removed (tombstoned)"
+                recv_associated,
+                send_associated,
+                cancelled = gate.is_cancelled(),
+                "Cancelling subject immediately: registration missing or instance removed"
             );
-            state.rx_subjects.remove(recv_subject);
+            self.registries
+                .cancel_registered_subject(StreamType::Response, recv_subject);
             if let Some(s) = send_subject {
-                state.tx_subjects.remove(s);
+                self.registries
+                    .cancel_registered_subject(StreamType::Request, s);
             }
             return false;
-        }
-        state
-            .subject_instance
-            .insert(recv_subject.to_string(), id.clone());
-        if let Some(s) = send_subject {
-            state.subject_instance.insert(s.to_string(), id.clone());
-        }
-        let entry = state.instance_subjects.entry(id.clone()).or_default();
-        entry.insert((StreamType::Response, recv_subject.to_string()));
-        if let Some(s) = send_subject {
-            entry.insert((StreamType::Request, s.to_string()));
         }
         true
     }
@@ -277,34 +447,18 @@ impl TcpStreamServer {
     /// Cancel one pending response-stream registration. Drops the
     /// `oneshot::Sender` so the waiting receiver resolves with `RecvError`.
     pub async fn cancel_recv_stream(&self, subject: &str) {
-        let mut state = self.state.lock().await;
-        state.rx_subjects.remove(subject);
-        if let Some(key) = state.subject_instance.remove(subject)
-            && let Some(subjects) = state.instance_subjects.get_mut(&key)
-        {
-            subjects.remove(&(StreamType::Response, subject.to_string()));
-            if subjects.is_empty() {
-                state.instance_subjects.remove(&key);
-            }
-        }
+        self.registries
+            .cancel_registered_subject(StreamType::Response, subject);
     }
 
     /// Cancel one pending request-stream registration. Parallel to
     /// [`Self::cancel_recv_stream`]: drops the `tx_subjects` entry and, if
     /// the subject was associated with an instance, clears its
-    /// `(StreamType::Request, _)` tag from `instance_subjects` so the per-
+    /// `(StreamType::Request, _)` tag from `instance_states` so the per-
     /// instance bookkeeping stays consistent.
     pub async fn cancel_send_stream(&self, subject: &str) {
-        let mut state = self.state.lock().await;
-        state.tx_subjects.remove(subject);
-        if let Some(key) = state.subject_instance.remove(subject)
-            && let Some(subjects) = state.instance_subjects.get_mut(&key)
-        {
-            subjects.remove(&(StreamType::Request, subject.to_string()));
-            if subjects.is_empty() {
-                state.instance_subjects.remove(&key);
-            }
-        }
+        self.registries
+            .cancel_registered_subject(StreamType::Request, subject);
     }
 
     /// Cancel all pending streams for an instance — both response-side and
@@ -312,25 +466,22 @@ impl TcpStreamServer {
     /// `associate_instance` — and tombstone the id so any racing associate
     /// for the same id cancels too. Returns the number of streams cancelled.
     pub async fn cancel_instance_streams(&self, id: &EndpointInstanceId) -> usize {
-        let mut state = self.state.lock().await;
         let now = Instant::now();
-        prune_tombstones(&mut state.removed_instances, now);
-        state.removed_instances.insert(id.clone(), now);
-        let subjects = match state.instance_subjects.remove(id) {
-            Some(subjects) => subjects,
-            None => return 0,
+        self.registries.prune_tombstones(now);
+        let subjects = {
+            let mut state = self
+                .registries
+                .instance_states
+                .entry(id.clone())
+                .or_default();
+            state.gate.cancel();
+            state.removed_at = Some(now);
+            std::mem::take(&mut state.subjects)
         };
         let count = subjects.len();
         for (kind, subject) in &subjects {
-            match kind {
-                StreamType::Response => {
-                    state.rx_subjects.remove(subject);
-                }
-                StreamType::Request => {
-                    state.tx_subjects.remove(subject);
-                }
-            }
-            state.subject_instance.remove(subject);
+            self.registries
+                .cancel_drained_subject(kind.clone(), subject);
         }
         count
     }
@@ -338,24 +489,23 @@ impl TcpStreamServer {
     /// Drop the tombstone for an instance that has reappeared in discovery,
     /// so future subjects for that identity are tracked normally.
     pub async fn clear_instance_tombstone(&self, id: &EndpointInstanceId) {
-        let mut state = self.state.lock().await;
-        state.removed_instances.remove(id);
+        if let Some(mut state) = self.registries.instance_states.get_mut(id)
+            && state.removed_at.is_some()
+        {
+            *state = InstanceState::default();
+        }
     }
 
-    #[allow(clippy::await_holding_lock)]
-    async fn start(local_ip: String, local_port: u16, state: Arc<Mutex<State>>) -> Result<u16> {
+    async fn start(
+        local_ip: String,
+        local_port: u16,
+        registries: Arc<StreamRegistries>,
+    ) -> Result<(u16, tokio::task::JoinHandle<Result<()>>)> {
         let addr = format!("{}:{}", local_ip, local_port);
-        let state_clone = state.clone();
-        let mut guard = state.lock().await;
-        if guard.handle.is_some() {
-            panic!("TcpStreamServer already started");
-        }
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<u16>>();
-        let handle = tokio::spawn(tcp_listener(addr, state_clone, ready_tx));
-        guard.handle = Some(handle);
-        drop(guard);
+        let handle = tokio::spawn(tcp_listener(addr, registries, ready_tx));
         let local_port = ready_rx.await??;
-        Ok(local_port)
+        Ok((local_port, handle))
     }
 }
 
@@ -396,15 +546,15 @@ impl ResponseService for TcpStreamServer {
             let connection_info = RequestedSendConnection {
                 context: options.context.clone(),
                 connection: pending_sender_tx,
+                instance_gate: None,
+                send_buffer_count: options.send_buffer_count,
             };
 
-            let mut state = self.state.lock().await;
-            state
-                .tx_subjects
-                .insert(sender_subject.clone(), connection_info);
+            self.registries
+                .insert_request_stream(sender_subject.clone(), connection_info);
 
             let cleanup_subject = sender_subject.clone();
-            let cleanup_state = self.state.clone();
+            let cleanup_registries = self.registries.clone();
             let registered_stream = RegisteredStream::new(
                 TcpStreamConnectionInfo {
                     address: address.clone(),
@@ -416,19 +566,7 @@ impl ResponseService for TcpStreamServer {
                 pending_sender_rx,
             )
             .with_cleanup(move || {
-                // Drop is sync; fire-and-forget the lock acquisition.
-                tokio::spawn(async move {
-                    let mut state = cleanup_state.lock().await;
-                    state.tx_subjects.remove(&cleanup_subject);
-                    if let Some(key) = state.subject_instance.remove(&cleanup_subject)
-                        && let Some(subjects) = state.instance_subjects.get_mut(&key)
-                    {
-                        subjects.remove(&(StreamType::Request, cleanup_subject.clone()));
-                        if subjects.is_empty() {
-                            state.instance_subjects.remove(&key);
-                        }
-                    }
-                });
+                cleanup_registries.cancel_registered_subject(StreamType::Request, &cleanup_subject);
             });
 
             Some(registered_stream)
@@ -443,15 +581,15 @@ impl ResponseService for TcpStreamServer {
             let connection_info = RequestedRecvConnection {
                 context: options.context.clone(),
                 connection: pending_recver_tx,
+                instance_gate: None,
+                send_buffer_count: options.send_buffer_count,
             };
 
-            let mut state = self.state.lock().await;
-            state
-                .rx_subjects
-                .insert(receiver_subject.clone(), connection_info);
+            self.registries
+                .insert_response_stream(receiver_subject.clone(), connection_info);
 
             let cleanup_subject = receiver_subject.clone();
-            let cleanup_state = self.state.clone();
+            let cleanup_registries = self.registries.clone();
             let registered_stream = RegisteredStream::new(
                 TcpStreamConnectionInfo {
                     address: address.clone(),
@@ -463,19 +601,8 @@ impl ResponseService for TcpStreamServer {
                 pending_recver_rx,
             )
             .with_cleanup(move || {
-                // Drop is sync; fire-and-forget the lock acquisition.
-                tokio::spawn(async move {
-                    let mut state = cleanup_state.lock().await;
-                    state.rx_subjects.remove(&cleanup_subject);
-                    if let Some(key) = state.subject_instance.remove(&cleanup_subject)
-                        && let Some(subjects) = state.instance_subjects.get_mut(&key)
-                    {
-                        subjects.remove(&(StreamType::Response, cleanup_subject.clone()));
-                        if subjects.is_empty() {
-                            state.instance_subjects.remove(&key);
-                        }
-                    }
-                });
+                cleanup_registries
+                    .cancel_registered_subject(StreamType::Response, &cleanup_subject);
             });
 
             Some(registered_stream)
@@ -498,7 +625,7 @@ impl ResponseService for TcpStreamServer {
 // to the sender
 async fn tcp_listener(
     addr: String,
-    state: Arc<Mutex<State>>,
+    registries: Arc<StreamRegistries>,
     read_tx: tokio::sync::oneshot::Sender<Result<u16>>,
 ) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -554,13 +681,13 @@ async fn tcp_listener(
             }
         }
 
-        tokio::spawn(handle_connection(stream, state.clone()));
+        tokio::spawn(handle_connection(stream, registries.clone()));
     }
 
     // #[instrument(level = "trace"), skip(state)]
     // todo - clone before spawn and trace process_stream
-    async fn handle_connection(stream: tokio::net::TcpStream, state: Arc<Mutex<State>>) {
-        let result = process_stream(stream, state).await;
+    async fn handle_connection(stream: tokio::net::TcpStream, registries: Arc<StreamRegistries>) {
+        let result = process_stream(stream, registries).await;
         match result {
             Ok(_) => tracing::trace!("successfully processed tcp connection"),
             Err(e) => {
@@ -573,7 +700,10 @@ async fn tcp_listener(
 
     /// This method is responsible for the internal tcp stream handshake
     /// The handshake will specialize the stream as a request/sender or response/receiver stream
-    async fn process_stream(stream: tokio::net::TcpStream, state: Arc<Mutex<State>>) -> Result<()> {
+    async fn process_stream(
+        stream: tokio::net::TcpStream,
+        registries: Arc<StreamRegistries>,
+    ) -> Result<()> {
         // split the socket in to a reader and writer
         let (read_half, write_half) = tokio::io::split(stream);
 
@@ -604,10 +734,11 @@ async fn tcp_listener(
         // branch here to handle sender stream or receiver stream
         match handshake.stream_type {
             StreamType::Request => {
-                process_request_stream(handshake.subject, state, framed_reader, framed_writer).await
+                process_request_stream(handshake.subject, registries, framed_reader, framed_writer)
+                    .await
             }
             StreamType::Response => {
-                process_response_stream(handshake.subject, state, framed_reader, framed_writer)
+                process_response_stream(handshake.subject, registries, framed_reader, framed_writer)
                     .await
             }
         }
@@ -625,38 +756,36 @@ async fn tcp_listener(
     /// read half, on fatal error, downstream should drop the request stream.
     async fn process_request_stream(
         subject: String,
-        state: Arc<Mutex<State>>,
+        registries: Arc<StreamRegistries>,
         reader: FramedRead<tokio::io::ReadHalf<tokio::net::TcpStream>, TwoPartCodec>,
         writer: FramedWrite<tokio::io::WriteHalf<tokio::net::TcpStream>, TwoPartCodec>,
     ) -> Result<()> {
         // Request stream is unidirectional; we don't read from the downstream.
         drop(reader);
 
-        let request_stream = {
-            let mut guard = state.lock().await;
-            let conn = guard.tx_subjects.remove(&subject).ok_or(error!(
+        let request_stream = registries.remove_request_stream(&subject).ok_or(error!(
                 "Subject not found: {}; downstream subscriber specified a subject unknown to the upstream publisher",
                 subject
             ))?;
-            if let Some(key) = guard.subject_instance.remove(&subject)
-                && let Some(subjects) = guard.instance_subjects.get_mut(&key)
-            {
-                subjects.remove(&(StreamType::Request, subject.clone()));
-                if subjects.is_empty() {
-                    guard.instance_subjects.remove(&key);
-                }
-            }
-            conn
-        };
+
+        if is_instance_cancelled(&request_stream.instance_gate) {
+            return Err(error!(
+                "Subject cancelled before request-stream call-home completed: {}",
+                subject
+            ));
+        }
 
         let RequestedSendConnection {
             context,
             connection,
+            instance_gate: _,
+            send_buffer_count,
         } = request_stream;
 
-        // Buffer size matches `process_response_stream`; both should be driven
-        // by the registration options rather than hard-coded. See #10293.
-        let (request_tx, request_rx) = mpsc::channel(64);
+        // Buffer size is driven by the registration options
+        // ([`StreamOptions::send_buffer_count`]) rather than hard-coded; the
+        // same applies to `process_response_stream`. See #10293.
+        let (request_tx, request_rx) = data_plane_channel(send_buffer_count);
 
         if connection
             .send(Ok(crate::pipeline::network::StreamSender {
@@ -744,31 +873,27 @@ async fn tcp_listener(
 
     async fn process_response_stream(
         subject: String,
-        state: Arc<Mutex<State>>,
+        registries: Arc<StreamRegistries>,
         mut reader: FramedRead<tokio::io::ReadHalf<tokio::net::TcpStream>, TwoPartCodec>,
         writer: FramedWrite<tokio::io::WriteHalf<tokio::net::TcpStream>, TwoPartCodec>,
     ) -> Result<()> {
-        let response_stream = {
-            let mut guard = state.lock().await;
-            let conn = guard
-                .rx_subjects
-                .remove(&subject)
-                .ok_or(error!("Subject not found: {}; upstream publisher specified a subject unknown to the downsteam subscriber", subject))?;
-            if let Some(key) = guard.subject_instance.remove(&subject)
-                && let Some(subjects) = guard.instance_subjects.get_mut(&key)
-            {
-                subjects.remove(&(StreamType::Response, subject.clone()));
-                if subjects.is_empty() {
-                    guard.instance_subjects.remove(&key);
-                }
-            }
-            conn
-        };
+        let response_stream = registries
+            .remove_response_stream(&subject)
+            .ok_or(error!("Subject not found: {}; upstream publisher specified a subject unknown to the downsteam subscriber", subject))?;
+
+        if is_instance_cancelled(&response_stream.instance_gate) {
+            return Err(error!(
+                "Subject cancelled before response-stream call-home completed: {}",
+                subject
+            ));
+        }
 
         // unwrap response_stream
         let RequestedRecvConnection {
             context,
             connection,
+            instance_gate: _,
+            send_buffer_count,
         } = response_stream;
 
         // the [`Prologue`]
@@ -807,9 +932,10 @@ async fn tcp_listener(
             return Err(error!("Received error prologue: {}", error));
         }
 
-        // Buffer size should be driven by the registration options rather than
-        // hard-coded; the same applies to `process_request_stream`. See #10293.
-        let (response_tx, response_rx) = mpsc::channel(64);
+        // Buffer size is driven by the registration options
+        // ([`StreamOptions::send_buffer_count`]) rather than hard-coded; the
+        // same applies to `process_request_stream`. See #10293.
+        let (response_tx, response_rx) = data_plane_channel(send_buffer_count);
 
         if connection
             .send(Ok(crate::pipeline::network::StreamReceiver {
@@ -1010,6 +1136,8 @@ mod tests {
     use super::*;
     use crate::engine::AsyncEngineContextProvider;
     use crate::pipeline::Context;
+    use crate::pipeline::network::DEFAULT_SEND_BUFFER_COUNT;
+    use crate::pipeline::network::tcp::client::TcpClient;
     use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
     use tokio::net::TcpStream;
 
@@ -1071,6 +1199,131 @@ mod tests {
         println!(
             "Server created successfully with address: {}",
             tcp_info.address
+        );
+    }
+
+    /// The data-plane channel helper sizes the mpsc buffer from
+    /// `send_buffer_count` — this is the value `process_request_stream` /
+    /// `process_response_stream` feed it. `max_capacity()` reflects the
+    /// channel's configured buffer, so a custom value and the default both
+    /// reach the channel. Guards against regressing back to a hard-coded 64.
+    #[test]
+    fn data_plane_channel_capacity_matches_send_buffer_count() {
+        let (tx, _rx) = data_plane_channel::<()>(7);
+        assert_eq!(tx.max_capacity(), 7);
+
+        let (tx, _rx) = data_plane_channel::<()>(DEFAULT_SEND_BUFFER_COUNT);
+        assert_eq!(tx.max_capacity(), 64);
+
+        // A misconfigured 0 must clamp to 1, not panic (mpsc::channel(0) panics).
+        let (tx, _rx) = data_plane_channel::<()>(0);
+        assert_eq!(tx.max_capacity(), 1);
+    }
+
+    /// `register` must thread `StreamOptions::send_buffer_count` through to the
+    /// stored `RequestedSendConnection` / `RequestedRecvConnection` (the
+    /// registration structs `process_*_stream` later destructure to size the
+    /// channel). Verified here against the real registration path.
+    #[tokio::test]
+    async fn register_threads_send_buffer_count_into_connection_structs() {
+        let server = TcpStreamServer::new(ServerOptions::default())
+            .await
+            .expect("server");
+        let context = Context::new(());
+        let options = StreamOptions::builder()
+            .context(context.context())
+            .enable_request_stream(true)
+            .enable_response_stream(true)
+            .send_buffer_count(7)
+            .build()
+            .unwrap();
+
+        let _pending = server.register(options).await;
+
+        assert_eq!(
+            server.registries.tx_subjects.len(),
+            1,
+            "one request stream registered"
+        );
+        assert_eq!(
+            server.registries.rx_subjects.len(),
+            1,
+            "one response stream registered"
+        );
+        assert!(
+            server
+                .registries
+                .tx_subjects
+                .iter()
+                .all(|c| c.value().send_buffer_count == 7),
+            "send_buffer_count must reach RequestedSendConnection"
+        );
+        assert!(
+            server
+                .registries
+                .rx_subjects
+                .iter()
+                .all(|c| c.value().send_buffer_count == 7),
+            "send_buffer_count must reach RequestedRecvConnection"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_tcp_stream_server_concurrent_response_registration() {
+        const STREAMS: usize = 128;
+
+        let result = time::timeout(std::time::Duration::from_secs(20), async {
+            let options = ServerOptions::builder().port(0).build().unwrap();
+            let server = TcpStreamServer::new(options).await.unwrap();
+
+            let mut pending_streams = Vec::with_capacity(STREAMS);
+            let mut client_tasks = Vec::with_capacity(STREAMS);
+
+            for idx in 0..STREAMS {
+                let context = Context::new(());
+                let stream_options = StreamOptions::builder()
+                    .context(context.context())
+                    .enable_request_stream(false)
+                    .enable_response_stream(true)
+                    .build()
+                    .unwrap();
+
+                let pending_connection = server.register(stream_options).await;
+                let registered_stream = pending_connection.recv_stream.unwrap();
+                let (connection_info, stream_provider) = registered_stream.into_parts();
+                let client_context =
+                    Context::with_id_and_metadata((), context.id().to_string(), Default::default());
+                let payload = Bytes::from(format!("payload-{idx}"));
+
+                pending_streams.push((idx, payload.clone(), stream_provider));
+                client_tasks.push(tokio::spawn(async move {
+                    let mut sender = TcpClient::create_response_stream(
+                        client_context.context(),
+                        connection_info,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    sender.send_prologue(None).await.unwrap();
+                    sender.send(payload).await.unwrap();
+                }));
+            }
+
+            for task in client_tasks {
+                task.await.unwrap();
+            }
+
+            for (idx, expected, stream_provider) in pending_streams {
+                let mut stream = stream_provider.await.unwrap().unwrap();
+                let actual = stream.rx.recv().await.unwrap();
+                assert_eq!(actual, expected, "payload mismatch for stream {idx}");
+            }
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "concurrent response stream registration timed out"
         );
     }
 
@@ -1331,7 +1584,12 @@ mod tests {
         // Cancel the individual subject
         server.cancel_recv_stream(&subject).await;
 
-        // Instance should have no remaining subjects
+        assert!(
+            !server.registries.instance_states.contains_key(&id),
+            "empty active instance state should be reclaimed"
+        );
+
+        // Cancelling the instance now should create an empty tombstone.
         let cancelled = server.cancel_instance_streams(&id).await;
         assert_eq!(
             cancelled, 0,
@@ -1361,25 +1619,44 @@ mod tests {
         let subject = tcp_info.subject.clone();
 
         // Verify it's in rx_subjects
-        {
-            let state = server.state.lock().await;
-            assert!(state.rx_subjects.contains_key(&subject));
-        }
+        assert!(server.registries.rx_subjects.contains_key(&subject));
 
         // Drop the RegisteredStream -- RAII cleanup should fire
         drop(recv_stream);
 
-        // Give the spawned cleanup task a moment to run
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Cleanup is synchronous now that it only touches DashMap registries.
+        assert!(
+            !server.registries.rx_subjects.contains_key(&subject),
+            "RAII cleanup should have removed the rx_subjects entry"
+        );
+    }
 
-        // Verify it's been removed from rx_subjects
-        {
-            let state = server.state.lock().await;
-            assert!(
-                !state.rx_subjects.contains_key(&subject),
-                "RAII cleanup should have removed the rx_subjects entry"
-            );
-        }
+    #[test]
+    fn test_registered_stream_drop_without_tokio_runtime() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (server, recv_stream, subject) = runtime.block_on(async {
+            let server = test_server().await;
+            let context = Context::new(());
+            let options = StreamOptions::builder()
+                .context(context.context())
+                .enable_request_stream(false)
+                .enable_response_stream(true)
+                .build()
+                .unwrap();
+            let pending = server.register(options).await;
+            let recv_stream = pending.recv_stream.unwrap();
+            let tcp_info: TcpStreamConnectionInfo =
+                recv_stream.connection_info.clone().try_into().unwrap();
+            (server, recv_stream, tcp_info.subject)
+        });
+
+        drop(runtime);
+        drop(recv_stream);
+
+        assert!(
+            !server.registries.rx_subjects.contains_key(&subject),
+            "cleanup should run synchronously without an active Tokio runtime"
+        );
     }
 
     #[tokio::test]
@@ -1408,13 +1685,10 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // The entry should still be in rx_subjects (cleanup was disarmed)
-        {
-            let state = server.state.lock().await;
-            assert!(
-                state.rx_subjects.contains_key(&subject),
-                "into_parts() should disarm the RAII cleanup"
-            );
-        }
+        assert!(
+            server.registries.rx_subjects.contains_key(&subject),
+            "into_parts() should disarm the RAII cleanup"
+        );
     }
 
     #[tokio::test]
@@ -1448,6 +1722,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_response_call_home_observes_cancelled_gate() {
+        let server = test_server().await;
+        let context = Context::new(());
+        let options = StreamOptions::builder()
+            .context(context.context())
+            .enable_request_stream(false)
+            .enable_response_stream(true)
+            .build()
+            .unwrap();
+        let pending = server.register(options).await;
+        let (connection_info, provider) = pending.recv_stream.unwrap().into_parts();
+        let tcp_info: TcpStreamConnectionInfo = connection_info.try_into().unwrap();
+        let id = make_eid("ns", "comp", "generate", 43);
+        assert!(
+            server
+                .associate_instance(&tcp_info.subject, None, &id)
+                .await
+        );
+
+        // Model cancellation's linearization point while deliberately leaving
+        // the subject in rx_subjects so call-home wins the DashMap removal race.
+        server
+            .registries
+            .instance_states
+            .get(&id)
+            .unwrap()
+            .gate
+            .cancel();
+
+        let stream = TcpStream::connect(&tcp_info.address).await.unwrap();
+        let (_read_half, write_half) = tokio::io::split(stream);
+        let mut writer = FramedWrite::new(write_half, TwoPartCodec::default());
+        writer
+            .send(TwoPartMessage::from_header(
+                serde_json::to_vec(&CallHomeHandshake {
+                    subject: tcp_info.subject,
+                    stream_type: StreamType::Response,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), provider)
+            .await
+            .expect("cancelled response provider should resolve promptly");
+        assert!(
+            outcome.is_err(),
+            "cancelled response call-home must drop the provider sender"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_call_home_observes_cancelled_gate() {
+        let server = test_server().await;
+        let context = Context::new(());
+        let options = StreamOptions::builder()
+            .context(context.context())
+            .enable_request_stream(true)
+            .enable_response_stream(true)
+            .build()
+            .unwrap();
+        let pending = server.register(options).await;
+        let (send_info, send_provider) = pending.send_stream.unwrap().into_parts();
+        let (recv_info, recv_provider) = pending.recv_stream.unwrap().into_parts();
+        let send_tcp_info: TcpStreamConnectionInfo = send_info.try_into().unwrap();
+        let recv_tcp_info: TcpStreamConnectionInfo = recv_info.try_into().unwrap();
+        let id = make_eid("ns", "comp", "generate", 44);
+        assert!(
+            server
+                .associate_instance(&recv_tcp_info.subject, Some(&send_tcp_info.subject), &id,)
+                .await
+        );
+
+        server
+            .registries
+            .instance_states
+            .get(&id)
+            .unwrap()
+            .gate
+            .cancel();
+
+        let stream = TcpStream::connect(&send_tcp_info.address).await.unwrap();
+        let (_read_half, write_half) = tokio::io::split(stream);
+        let mut writer = FramedWrite::new(write_half, TwoPartCodec::default());
+        writer
+            .send(TwoPartMessage::from_header(
+                serde_json::to_vec(&CallHomeHandshake {
+                    subject: send_tcp_info.subject,
+                    stream_type: StreamType::Request,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), send_provider)
+            .await
+            .expect("cancelled request provider should resolve promptly");
+        assert!(
+            outcome.is_err(),
+            "cancelled request call-home must drop the provider sender"
+        );
+
+        server.cancel_recv_stream(&recv_tcp_info.subject).await;
+        assert!(recv_provider.await.is_err());
+    }
+
+    #[tokio::test]
     async fn test_clear_tombstone_allows_new_associations() {
         let server = test_server().await;
 
@@ -1466,6 +1851,44 @@ mod tests {
             cancelled, 1,
             "After clearing tombstone, subjects should be tracked normally"
         );
+    }
+
+    #[tokio::test]
+    async fn test_clear_tombstone_installs_new_gate_generation() {
+        let server = test_server().await;
+        let id = make_eid("ns", "comp", "generate", 45);
+
+        let (old_subject, old_provider) = register_and_get_subject(&server).await;
+        assert!(server.associate_instance(&old_subject, None, &id).await);
+        let old_gate = server
+            .registries
+            .instance_states
+            .get(&id)
+            .unwrap()
+            .gate
+            .clone();
+
+        assert_eq!(server.cancel_instance_streams(&id).await, 1);
+        assert!(old_gate.is_cancelled());
+        assert!(old_provider.await.is_err());
+
+        server.clear_instance_tombstone(&id).await;
+        let (new_subject, new_provider) = register_and_get_subject(&server).await;
+        assert!(server.associate_instance(&new_subject, None, &id).await);
+        let new_gate = server
+            .registries
+            .instance_states
+            .get(&id)
+            .unwrap()
+            .gate
+            .clone();
+
+        assert!(!Arc::ptr_eq(&old_gate, &new_gate));
+        assert!(old_gate.is_cancelled());
+        assert!(!new_gate.is_cancelled());
+
+        assert_eq!(server.cancel_instance_streams(&id).await, 1);
+        assert!(new_provider.await.is_err());
     }
 
     #[tokio::test]
@@ -1558,17 +1981,20 @@ mod tests {
     async fn test_tombstone_expires_after_ttl() {
         // After TOMBSTONE_TTL elapses, a previously-tombstoned identity must
         // accept new associations again, AND the entry must be physically
-        // pruned from `removed_instances` so the set remains bounded.
+        // replaced in `instance_states` so the set remains bounded.
         let server = test_server().await;
 
         let id = make_eid("ns", "comp", "generate", 42);
 
         // Tombstone the identity.
         server.cancel_instance_streams(&id).await;
-        {
-            let state = server.state.lock().await;
-            assert!(state.removed_instances.contains_key(&id));
-        }
+        assert!(
+            server
+                .registries
+                .instance_states
+                .get(&id)
+                .is_some_and(|state| state.removed_at.is_some())
+        );
 
         // Advance past the TTL.
         tokio::time::advance(TOMBSTONE_TTL + Duration::from_secs(1)).await;
@@ -1581,15 +2007,47 @@ mod tests {
             "tombstone older than TTL should not block association"
         );
 
-        // The expired tombstone must have been pruned (lazy pruning fires on
-        // every associate_instance/cancel_instance_streams call).
-        {
-            let state = server.state.lock().await;
-            assert!(
-                !state.removed_instances.contains_key(&id),
-                "expired tombstone should be pruned, not retained"
-            );
-        }
+        // The expired tombstone for this identity must have been replaced by
+        // a fresh active generation without scanning unrelated identities.
+        assert!(
+            server
+                .registries
+                .instance_states
+                .get(&id)
+                .is_some_and(|state| state.removed_at.is_none()),
+            "expired tombstone should be pruned, not retained"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_associate_refreshes_only_target_tombstone() {
+        let server = test_server().await;
+        let target_id = make_eid("ns", "comp", "generate", 42);
+        let sibling_id = make_eid("ns", "comp", "generate", 43);
+
+        server.cancel_instance_streams(&target_id).await;
+        server.cancel_instance_streams(&sibling_id).await;
+        tokio::time::advance(TOMBSTONE_TTL + Duration::from_secs(1)).await;
+
+        let (subject, _provider) = register_and_get_subject(&server).await;
+        assert!(server.associate_instance(&subject, None, &target_id).await);
+
+        assert!(
+            server
+                .registries
+                .instance_states
+                .get(&target_id)
+                .is_some_and(|state| state.removed_at.is_none()),
+            "the associated instance should receive a fresh active generation"
+        );
+        assert!(
+            server
+                .registries
+                .instance_states
+                .get(&sibling_id)
+                .is_some_and(|state| state.removed_at.is_some()),
+            "association should not scan and prune unrelated tombstones"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1625,16 +2083,19 @@ mod tests {
         tokio::time::advance(TOMBSTONE_TTL + Duration::from_secs(1)).await;
         server.cancel_instance_streams(&id_new).await;
 
-        let state = server.state.lock().await;
         assert!(
-            !state.removed_instances.contains_key(&id_old),
+            !server.registries.instance_states.contains_key(&id_old),
             "old tombstone should be pruned by the next cancel_instance_streams call"
         );
         assert!(
-            state.removed_instances.contains_key(&id_new),
+            server
+                .registries
+                .instance_states
+                .get(&id_new)
+                .is_some_and(|state| state.removed_at.is_some()),
             "fresh tombstone should be retained"
         );
-        assert_eq!(state.removed_instances.len(), 1);
+        assert_eq!(server.registries.instance_states.len(), 1);
     }
 
     #[tokio::test]
@@ -1651,9 +2112,12 @@ mod tests {
         server.cancel_instance_streams(&id_a).await;
         server.clear_instance_tombstone(&id_b).await;
 
-        let state = server.state.lock().await;
         assert!(
-            state.removed_instances.contains_key(&id_a),
+            server
+                .registries
+                .instance_states
+                .get(&id_a)
+                .is_some_and(|state| state.removed_at.is_some()),
             "clearing a different identity must not remove id_a's tombstone"
         );
     }
