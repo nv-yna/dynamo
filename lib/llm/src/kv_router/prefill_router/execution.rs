@@ -57,6 +57,15 @@ impl PrefillRouter {
         } else {
             None
         };
+        if crate::kv_router::select_trace_on() {
+            tracing::warn!(
+                target: "dynamo_select_trace",
+                site = "resolve_sticky_prefill_worker",
+                request_id = %context_id,
+                sticky_hit = sticky_worker.is_some(),
+                "sticky prefill worker resolution"
+            );
+        }
 
         // Worker selection
         let (worker_id, dp_rank) = if let Some(worker) = sticky_worker {
@@ -182,10 +191,23 @@ impl PrefillRouter {
             return None;
         }
 
-        match router
+        let validate_start = std::time::Instant::now();
+        let validate_result = router
             .validate_sticky_prefill_worker(context_id, req, worker)
-            .await
-        {
+            .await;
+        if crate::kv_router::select_trace_on() {
+            tracing::warn!(
+                target: "dynamo_select_trace",
+                site = "validate_sticky_prefill_worker",
+                request_id = %context_id,
+                worker_id = worker.worker_id,
+                dp_rank = worker.dp_rank,
+                validate_ms = validate_start.elapsed().as_millis() as u64,
+                validate_ok = validate_result.is_ok(),
+                "sticky prefill worker validation"
+            );
+        }
+        match validate_result {
             Ok(worker) => {
                 router.refresh_sticky_prefill_worker(req);
                 Some(worker)

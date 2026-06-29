@@ -44,6 +44,14 @@ impl RequestCleanup {
     async fn finish(&mut self) {
         // Free scheduler state before closing the session so both explicit and
         // drop cleanup preserve the same lifecycle ordering.
+        if crate::kv_router::select_trace_on() && self.scheduler_tracked {
+            tracing::warn!(
+                target: "dynamo_select_trace",
+                site = "free",
+                request_id = %self.context_id,
+                "prefill load released (request finish: freeing scheduler state)"
+            );
+        }
         if self.scheduler_tracked
             && let Err(error) = self.chooser.free(&self.context_id).await
         {
@@ -338,6 +346,14 @@ impl RequestGuard {
                         request_id = %self.cleanup.context_id,
                         %error,
                         "Failed to mark prefill completed"
+                    );
+                }
+                if crate::kv_router::select_trace_on() && self.cleanup.scheduler_tracked {
+                    tracing::warn!(
+                        target: "dynamo_select_trace",
+                        site = "mark_prefill_completed",
+                        request_id = %self.cleanup.context_id,
+                        "prefill load released (prefill-first-token observed)"
                     );
                 }
                 self.prefill_marked = true;

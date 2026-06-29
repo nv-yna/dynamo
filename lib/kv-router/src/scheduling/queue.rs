@@ -30,6 +30,18 @@ use crate::protocols::{
 use crate::sequences::topology::WorkerDpRange;
 use crate::sequences::{ActiveSequencesMultiWorker, SequencePublisher, SequenceRequest};
 
+/// Diagnostic select-trace gate (DYN_SELECT_TRACE=1|true|on|yes). Cached once.
+/// Used to decompose the silent frontend prefill-router admission stall between
+/// `request received` and `Selected worker phase=Prefill`. Zero-cost when off.
+pub(crate) fn select_trace_on() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| {
+        std::env::var("DYN_SELECT_TRACE")
+            .map(|v| matches!(v.trim(), "1" | "true" | "on" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
 /// Large default for max_num_batched_tokens when not configured (effectively disables queueing for that worker)
 pub const DEFAULT_MAX_BATCHED_TOKENS: u64 = 10_000_000;
 
@@ -431,7 +443,23 @@ impl<
             return;
         }
 
-        if self.all_workers_prefill_busy(threshold, request.eligibility(), decay_now) {
+        let busy = self.all_workers_prefill_busy(threshold, request.eligibility(), decay_now);
+        if select_trace_on() {
+            tracing::warn!(
+                target: "dynamo_select_trace",
+                site = "admission: park vs admit",
+                busy,
+                request_id = request.maybe_request_id.as_deref().unwrap_or("unknown"),
+                isl_tokens = request.isl_tokens,
+                update_states = request.update_states,
+                pinned = ?request.pinned_worker,
+                threshold,
+                pending_count = self.pending_count.load(AtomicOrdering::Relaxed),
+                pending_isl_tokens = self.pending_isl_tokens.load(AtomicOrdering::Relaxed),
+                "handle_enqueue admission decision"
+            );
+        }
+        if busy {
             if !self.queue_depth_tiers.is_unbounded() {
                 let pending_isl_tokens = self.pending_isl_tokens.load(AtomicOrdering::Relaxed);
                 // This is a rejection threshold on current queued ISL, not a hard
@@ -508,6 +536,23 @@ impl<
             // otherwise constrained request can temporarily stall later
             // schedulable entries until we adopt a cheaper non-HOL strategy.
             if self.all_workers_prefill_busy(threshold, front.request.eligibility(), decay_now) {
+                if select_trace_on() {
+                    let front_request_id = front
+                        .request
+                        .maybe_request_id
+                        .as_deref()
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let front_pinned = front.request.pinned_worker;
+                    tracing::warn!(
+                        target: "dynamo_select_trace",
+                        site = "drain stopped HOL",
+                        request_id = front_request_id,
+                        pinned = ?front_pinned,
+                        pending_count = self.pending_count.load(AtomicOrdering::Relaxed),
+                        "handle_update head-of-line drain stopped: front still prefill-busy"
+                    );
+                }
                 break;
             }
             let entry = self.pending.pop().expect("heap front vanished before pop");
@@ -564,6 +609,17 @@ impl<
                 self.pending_isl_tokens
                     .fetch_add(isl_tokens, AtomicOrdering::Relaxed);
                 break;
+            }
+            if select_trace_on() {
+                let parked_ms = entry.enqueue_at.elapsed().as_millis() as u64;
+                tracing::warn!(
+                    target: "dynamo_select_trace",
+                    site = "dequeue admit",
+                    request_id = request.maybe_request_id.as_deref().unwrap_or("unknown"),
+                    parked_ms,
+                    pending_count = self.pending_count.load(AtomicOrdering::Relaxed),
+                    "handle_update admitting parked request from pending queue"
+                );
             }
             tracing::debug!("scheduling request from pending queue");
             self.admit_one(request, admit_now);

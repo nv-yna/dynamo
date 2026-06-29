@@ -36,6 +36,18 @@ use futures::stream;
 use tracing::Instrument;
 use validator::Validate;
 
+/// Diagnostic select-trace gate (DYN_SELECT_TRACE=1|true|on|yes). Cached once.
+/// Used to decompose the silent frontend prefill-router admission stall between
+/// `request received` and `Selected worker phase=Prefill`. Zero-cost when off.
+pub(crate) fn select_trace_on() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| {
+        std::env::var("DYN_SELECT_TRACE")
+            .map(|v| matches!(v.trim(), "1" | "true" | "on" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
 // Re-export from dynamo-kv-router crate
 pub use dynamo_kv_router::approx;
 pub use dynamo_kv_router::protocols;
@@ -460,6 +472,19 @@ where
         let tier_overlap_blocks = tier_overlap_blocks_from_tiered_matches(&tiered_matches);
         let cache_hit_estimates = self.cache_hit_estimates_from_tiered_matches(&tiered_matches);
         let find_matches_elapsed = start.elapsed();
+
+        if select_trace_on() {
+            tracing::warn!(
+                target: "dynamo_select_trace",
+                site = "query_tiered_matches",
+                request_id = context_id.unwrap_or("unknown"),
+                hash_ms = hash_elapsed.as_millis() as u64,
+                indexer_ms = indexer_duration.as_millis() as u64,
+                shared_cache_ms = shared_cache_duration.map(|d| d.as_millis() as u64),
+                find_matches_ms = find_matches_elapsed.as_millis() as u64,
+                "tiered match lookup timings"
+            );
+        }
 
         // Capture shared cache info for metrics before moving into schedule().
         // Clone the hits so we can compute `hits_beyond(overlap_blocks)` after

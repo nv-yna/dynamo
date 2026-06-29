@@ -120,7 +120,17 @@ impl
             req.tracker = Some(Arc::new(RequestTracker::new()));
         }
         let tracker = req.tracker.as_ref().unwrap();
+        let phase_acquire_start = std::time::Instant::now();
         let prefill_phase_barrier = tracker.set_phase(RequestPhase::Prefill).await;
+        if crate::kv_router::select_trace_on() {
+            tracing::warn!(
+                target: "dynamo_select_trace",
+                site = "set_phase(Prefill)",
+                request_id = %request_id,
+                phase_acquire_ms = phase_acquire_start.elapsed().as_millis() as u64,
+                "prefill phase barrier acquired"
+            );
+        }
 
         // Prepare prefill request with max_tokens = 1 (clone after tracker is set)
         let mut prefill_req = req.clone();
@@ -141,10 +151,20 @@ impl
         }
 
         let endpoint_id = self.endpoint_id.get();
-        let (prefill_result, topology_constraints) = match self
+        let resolve_start = std::time::Instant::now();
+        let prefill_decision = self
             .resolve_prefill_worker(&request_id, &prefill_req, preselected_worker)
-            .await
-        {
+            .await;
+        if crate::kv_router::select_trace_on() {
+            tracing::warn!(
+                target: "dynamo_select_trace",
+                site = "resolve_prefill_worker",
+                request_id = %request_id,
+                resolve_ms = resolve_start.elapsed().as_millis() as u64,
+                "prefill worker resolved"
+            );
+        }
+        let (prefill_result, topology_constraints) = match prefill_decision {
             PrefillResolveDecision::Resolved {
                 worker_id,
                 dp_rank,

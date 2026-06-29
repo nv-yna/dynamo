@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use super::overlap_refresh::{NoopOverlapScoresRefresh, OverlapScoresRefresh};
 use super::policy::{RouterSchedulingPolicy, SchedulingPolicy};
 use super::prefill_load::PrefillLoadEstimator;
-use super::queue::SchedulerQueue;
+use super::queue::{SchedulerQueue, select_trace_on};
 use super::selector::{DefaultWorkerSelector, WorkerSelector};
 use super::types::{
     KvSchedulerError, OverloadedWorkerProvider, PotentialLoad, SchedulingRequest,
@@ -275,6 +275,16 @@ where
         let track_prefill_tokens = router_config_override
             .and_then(|cfg| cfg.track_prefill_tokens)
             .unwrap_or(self.track_prefill_tokens_default);
+        // Capture loggable copies BEFORE constructing `request` (these fields get moved into it).
+        let trace_on = select_trace_on();
+        let trace_request_id = if trace_on {
+            maybe_request_id.clone().unwrap_or_else(|| "unknown".to_string())
+        } else {
+            String::new()
+        };
+        let trace_isl_tokens = isl_tokens;
+        let trace_update_states = update_states;
+        let trace_pinned = pinned_worker; // WorkerWithDpRank is Copy
         let request = SchedulingRequest {
             maybe_request_id,
             token_seq,
@@ -297,13 +307,32 @@ where
             resp_tx: Some(resp_tx),
         };
 
+        let enqueue_start = Instant::now();
         self.queue
             .enqueue_with_block_hashes(request, block_hashes)
             .await;
+        let enqueue_ms = enqueue_start.elapsed().as_millis() as u64;
 
-        resp_rx
+        let wait_start = Instant::now();
+        let resp = resp_rx
             .await
-            .map_err(|_| KvSchedulerError::SubscriberShutdown)?
+            .map_err(|_| KvSchedulerError::SubscriberShutdown)?;
+        if trace_on {
+            let response_wait_ms = wait_start.elapsed().as_millis() as u64;
+            tracing::warn!(
+                target: "dynamo_select_trace",
+                site = "schedule_with_block_hashes",
+                request_id = trace_request_id,
+                isl_tokens = trace_isl_tokens,
+                update_states = trace_update_states,
+                pinned = ?trace_pinned,
+                enqueue_ms,
+                response_wait_ms,
+                pending_count = self.queue.pending_count(),
+                "scheduler admission round-trip"
+            );
+        }
+        resp
     }
 
     pub fn register_workers(&self, worker_ids: &HashSet<WorkerId>) {
