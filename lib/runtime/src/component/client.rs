@@ -300,6 +300,14 @@ struct RoutingInstancesState {
     update_lock: StdMutex<()>,
     instance_avail_tx: tokio::sync::watch::Sender<Vec<u64>>,
     instance_avail_rx: tokio::sync::watch::Receiver<Vec<u64>>,
+    // Fault-detection hysteresis: consecutive is_inhibited failures observed per
+    // instance. We only actually inhibit (remove from routable) once the count
+    // reaches `inhibit_threshold`. Default threshold 1 == legacy behavior (inhibit
+    // on first failure). Set DYN_FAULT_INHIBIT_THRESHOLD>1 to tolerate transient
+    // request-plane timeouts (e.g. ACK misses under decode saturation) without
+    // removing a live worker — the failure mode that flapped a healthy GEN worker.
+    inhibit_failure_counts: DashMap<u64, u32>,
+    inhibit_threshold: u32,
 }
 
 impl RoutingInstancesState {
@@ -312,6 +320,12 @@ impl RoutingInstancesState {
             update_lock: StdMutex::new(()),
             instance_avail_tx,
             instance_avail_rx,
+            inhibit_failure_counts: DashMap::new(),
+            inhibit_threshold: std::env::var("DYN_FAULT_INHIBIT_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|&n| n >= 1)
+                .unwrap_or(1),
         }
     }
 
@@ -363,6 +377,30 @@ impl RoutingInstancesState {
 
     fn report_instance_down(&self, instance_id: u64) {
         self.update(|current| current.report_instance_down(instance_id), true);
+    }
+
+    /// Record an is_inhibited failure for `instance_id`. Only inhibits (removes
+    /// from the routable set) once `inhibit_threshold` consecutive failures are
+    /// seen. Returns true iff this call inhibited the instance.
+    fn report_instance_failure(&self, instance_id: u64) -> bool {
+        let count = {
+            let mut entry = self.inhibit_failure_counts.entry(instance_id).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        if count >= self.inhibit_threshold {
+            self.inhibit_failure_counts.remove(&instance_id);
+            self.report_instance_down(instance_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reset the consecutive-failure counter for `instance_id` (success path), so
+    /// only *consecutive* failures accumulate toward the inhibit threshold.
+    fn report_instance_recovered(&self, instance_id: u64) {
+        self.inhibit_failure_counts.remove(&instance_id);
     }
 
     fn set_overloaded_instances(&self, overloaded_instance_ids: &[u64]) -> bool {
@@ -541,6 +579,28 @@ impl Client {
     pub fn report_instance_down(&self, instance_id: u64) {
         self.routing_instances.report_instance_down(instance_id);
         tracing::debug!("inhibiting instance {instance_id}");
+    }
+
+    /// Fault-detection entry point WITH hysteresis. Only inhibits the instance
+    /// after `DYN_FAULT_INHIBIT_THRESHOLD` (default 1) consecutive is_inhibited
+    /// failures. Prefer this over `report_instance_down` on the request hot path
+    /// so a transient request-plane timeout does not remove a live worker.
+    pub fn report_instance_failure(&self, instance_id: u64) {
+        let threshold = self.routing_instances.inhibit_threshold;
+        if self.routing_instances.report_instance_failure(instance_id) {
+            tracing::debug!(
+                "inhibiting instance {instance_id} (>= {threshold} consecutive failures)"
+            );
+        } else {
+            tracing::debug!(
+                "transient failure for instance {instance_id} (inhibit threshold {threshold}); not inhibiting yet"
+            );
+        }
+    }
+
+    /// Reset the consecutive-failure counter for `instance_id` (success path).
+    pub fn report_instance_recovered(&self, instance_id: u64) {
+        self.routing_instances.report_instance_recovered(instance_id);
     }
 
     /// Replace the set of overloaded instances reported by the worker monitor.

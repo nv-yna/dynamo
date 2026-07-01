@@ -38,7 +38,6 @@ use dynamo_runtime::metrics::frontend_perf::{
     DETOKENIZE_TOKEN_COUNT, DETOKENIZE_TOTAL_US, STAGE_DURATION_SECONDS, STAGE_PREPROCESS,
     StageGuard, TEMPLATE_SECONDS, TOKENIZE_SECONDS,
 };
-use std::borrow::Cow;
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 use tracing;
 
@@ -680,6 +679,7 @@ impl OpenAIPreprocessor {
         let (token_ids, annotations) = {
             let _nvtx = dynamo_nvtx_range!("preprocess.tokenize");
             self.gather_tokens(request, formatted_prompt.as_deref(), tracker)
+                .await
                 .with_context(|| "Failed to gather tokens")?
         };
         TOKENIZE_SECONDS.observe(tokenize_start.elapsed().as_secs_f64());
@@ -1609,7 +1609,7 @@ impl OpenAIPreprocessor {
     /// the caller asked for. The caller owns the result and is responsible for
     /// installing it on the builder via `builder.token_ids(...)` once any
     /// downstream consumers (e.g. MM-routing) have borrowed it.
-    pub fn gather_tokens<
+    pub async fn gather_tokens<
         R: OAIChatLikeRequest
             + AnnotationsProvider
             + SamplingOptionsProvider
@@ -1692,10 +1692,10 @@ impl OpenAIPreprocessor {
                                 tracing::warn!(
                                     "backend_instance_id provided but no token_data; tokenizing prompt"
                                 );
-                                let encoding = self.encode_with_timing(prompt, tracker)?;
+                                let encoding = self.encode_with_timing(prompt, tracker).await?;
                                 (encoding.token_ids().to_vec(), false)
                             } else {
-                                let encoding = self.encode_with_timing(prompt, tracker)?;
+                                let encoding = self.encode_with_timing(prompt, tracker).await?;
                                 (encoding.token_ids().to_vec(), false)
                             };
 
@@ -1713,7 +1713,7 @@ impl OpenAIPreprocessor {
                         }
                         TextInput::Batch(texts) => {
                             if texts.len() == 1 {
-                                let encoding = self.encode_with_timing(&texts[0], tracker)?;
+                                let encoding = self.encode_with_timing(&texts[0], tracker).await?;
                                 let tokens = encoding.token_ids().to_vec();
                                 token_count = Some(tokens.len());
                                 tokens_out = tokens;
@@ -1760,21 +1760,71 @@ impl OpenAIPreprocessor {
         Ok(())
     }
 
-    fn encode_with_timing(
+    async fn encode_with_timing(
         &self,
         prompt: &str,
         tracker: Option<&RequestTracker>,
     ) -> anyhow::Result<Encoding> {
         let encode_start = Instant::now();
-        let prompt = if prompt.contains('\0') {
+        // Offload the CPU-heavy BPE encode to the bounded blocking pool instead of running it on
+        // the async event loop. For DeepSeek-V4's ~40k-token prompts at high concurrency, a
+        // synchronous encode here stalls the frontend tokio runtime for seconds, starving the
+        // request-plane I/O -> 5s ACK timeout -> CannotConnect -> worker-inhibit cascade -> collapse.
+        // Own the prompt + clone the tokenizer (Arc) so the closure is 'static+Send; mirrors the
+        // embedding path's spawn_blocking offload.
+        let owned = if prompt.contains('\0') {
             tracing::debug!("Prompt contains null bytes; stripping to avoid tokenizer divergence");
-            Cow::Owned(prompt.replace('\0', ""))
+            prompt.replace('\0', "")
         } else {
-            Cow::Borrowed(prompt)
+            prompt.to_string()
         };
-        let encoding = self.tokenizer.encode(prompt.as_ref())?;
+        let tokenizer = self.tokenizer.clone();
+        // Time the encode INSIDE the blocking task (after it is actually scheduled) so we can split
+        // total offload latency into pool-queue-wait (submit->run) vs encode (run->done). This
+        // resolves whether the receive->dispatch TTFT gap is the spawn_blocking POOL QUEUE (codex's
+        // hypothesis) or downstream router-queue (per-log hypothesis).
+        let (encoding, enc_dur): (Encoding, std::time::Duration) =
+            tokio::task::spawn_blocking(move || {
+                let run = std::time::Instant::now();
+                tokenizer.encode(&owned).map(|e| (e, run.elapsed()))
+            })
+            .await??;
+        let total = encode_start.elapsed();
         if let Some(t) = tracker {
-            t.record_tokenize_latency(encode_start.elapsed());
+            t.record_tokenize_latency(total);
+        }
+        // Per-op attribution (DYN_STALL_OP_TRACE=1): op=tokenize busy_ms = pool_wait + encode.
+        // pool_wait = total - encode = how long the request waited for a free blocking-pool thread.
+        {
+            static STALL_OP_WARN_MS: std::sync::OnceLock<Option<u128>> = std::sync::OnceLock::new();
+            let warn = *STALL_OP_WARN_MS.get_or_init(|| {
+                if std::env::var("DYN_STALL_OP_TRACE")
+                    .ok()
+                    .is_some_and(|v| v == "1" || v == "true")
+                {
+                    Some(
+                        std::env::var("DYN_STALL_OP_WARN_MS")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(50u128),
+                    )
+                } else {
+                    None
+                }
+            });
+            if let Some(warn_ms) = warn {
+                let total_ms = total.as_millis();
+                if total_ms >= warn_ms {
+                    tracing::warn!(
+                        target: "dynamo_stall_op",
+                        op = "tokenize",
+                        busy_ms = total_ms as u64,
+                        pool_wait_ms = total.saturating_sub(enc_dur).as_millis() as u64,
+                        encode_ms = enc_dur.as_millis() as u64,
+                        "tokenize offload latency (busy_ms = pool_wait + encode)"
+                    );
+                }
+            }
         }
         Ok(encoding)
     }
@@ -3034,7 +3084,7 @@ impl
         } else {
             // Normal path: tokenize the prompt; embeddings don't need MM routing,
             // so install tokens on the builder right away.
-            let (token_ids, ann) = self.gather_tokens(&request, None, tracker.as_deref())?;
+            let (token_ids, ann) = self.gather_tokens(&request, None, tracker.as_deref()).await?;
             builder.token_ids(token_ids);
             ann
         };
