@@ -242,6 +242,11 @@ impl ActiveSequences {
 
     /// Mark prefill as completed for a request, removing it from prompt-load tracking.
     pub(super) fn mark_prefill_completed(&mut self, request_id: &RequestId, decay_now: Instant) {
+        // EMA-decay: fold the observed charge->completion latency into this
+        // worker's EMA BEFORE removing the charge timestamp. Only this path
+        // (genuine prefill completion) feeds the EMA; the free() path below
+        // does not, so cancelled-before-completion requests do not pollute it.
+        self.prefill.note_completion(request_id, decay_now);
         let _ = self.prefill.remove(request_id, decay_now);
         self.validate_state();
     }

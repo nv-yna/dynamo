@@ -4,7 +4,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -183,6 +183,30 @@ pub fn router_discovery_query(namespace: String, component: String) -> Discovery
         endpoint: KV_ROUTER_ENDPOINT.to_string(),
     }
 }
+
+/// Assumed prefill throughput (tokens/sec) used to synthesize an
+/// `expected_prefill_duration` when the selected worker has no prefill-load
+/// model (`router_prefill_load_model=none`, the default). Read ONCE from
+/// `DYN_ROUTER_ASSUMED_PREFILL_TOK_PER_SEC` (default 50000.0) at first use, so
+/// the decay rate is tunable across runs WITHOUT rebuilding the image.
+///
+/// Rationale (decay-floor fix): with no model, this arm previously returned
+/// `None`, which makes the prefill tracker anchor the active-prefill-tokens
+/// signal at full and never decay it (see
+/// `lib/kv-router/src/sequences/prefill_tracker.rs`, the unmodeled
+/// `anchored_full` path). Under decode-collapse the signal ratchets, the
+/// admission gate's wait runs away, and decode starves. Feeding a synthetic
+/// duration routes the tracker onto its all-modeled aggregate-drain (decay)
+/// path — preserving backpressure while killing the ratchet. When
+/// `DYN_ROUTER_PREFILL_EMA_ENABLE=1` this fixed value is used only as the
+/// pre-warmup seed for the per-worker adaptive EMA (see prefill_tracker.rs).
+static ASSUMED_PREFILL_TOK_PER_SEC: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+    std::env::var("DYN_ROUTER_ASSUMED_PREFILL_TOK_PER_SEC")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(50_000.0)
+});
 
 /// A KvRouter only decides which worker you should use. It doesn't send you there.
 /// TODO: Rename this to indicate it only selects a worker, it does not route.
@@ -712,7 +736,12 @@ where
                     None
                 }
             },
-            None => None,
+            // decay-floor fix: no prefill-load model -> synthesize a duration so the
+            // tracker takes its aggregate-drain (decay) path instead of anchoring full.
+            // With EMA enabled this is only the pre-warmup seed (prefill_tracker.rs).
+            None => Some(Duration::from_secs_f64(
+                effective_isl as f64 / *ASSUMED_PREFILL_TOK_PER_SEC,
+            )),
         };
 
         Some(PrefillLoadHint {

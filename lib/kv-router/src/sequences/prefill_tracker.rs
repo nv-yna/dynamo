@@ -10,6 +10,58 @@ use tokio::time::Instant;
 use super::single::RequestId;
 use crate::protocols::WorkerWithDpRank;
 
+// ---------------------------------------------------------------------------
+// EMA-decay: self-calibrating adaptive prefill-duration.
+//
+// The decay-floor fix synthesizes a FIXED `expected_prefill_duration`
+// (`effective_isl / DYN_ROUTER_ASSUMED_PREFILL_TOK_PER_SEC`) so the
+// active-prefill-tokens signal decays instead of ratcheting. Fixed-rate cannot
+// match the GROWING charge->complete latency under decode-collapse, so it
+// under-counts and creeps. This path instead sets each newly-charged request's
+// `expected_prefill_duration` to a per-worker EMA of the ACTUALLY observed
+// charge->mark_prefill_completed latency, clamped to [floor, cap]. The decay
+// window then tracks reality (neither the None ratchet nor the fixed-rate
+// under-count), adaptively, with no external metric.
+//
+// All knobs are read ONCE at first use (LazyLock) so runs can be tuned WITHOUT
+// rebuilding the image. When `DYN_ROUTER_PREFILL_EMA_ENABLE` is off the tracker
+// is untouched and the (decay-floor / AIC / None) hint duration flows through
+// unchanged — the same image reproduces the fixed-rate baseline.
+static EMA_ENABLE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("DYN_ROUTER_PREFILL_EMA_ENABLE")
+        .ok()
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false)
+});
+/// EMA smoothing factor in (0, 1]. Higher = faster adaptation to recent
+/// latencies; lower = smoother. Default 0.1.
+static EMA_ALPHA: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+    std::env::var("DYN_ROUTER_PREFILL_EMA_ALPHA")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0 && *v <= 1.0)
+        .unwrap_or(0.1)
+});
+/// Lower clamp (ms) on the synthesized decay window — prevents a zero/near-zero
+/// window (instant drain -> over-admission). Default 10ms.
+static EMA_FLOOR_MS: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+    std::env::var("DYN_ROUTER_PREFILL_EMA_FLOOR_MS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(10.0)
+});
+/// Upper clamp (ms) on the synthesized decay window — bounds a runaway EMA (e.g.
+/// a stuck/cancelled-late request) so backpressure still releases. Default
+/// 120000ms, matching the predicted-indexer TTL horizon.
+static EMA_CAP_MS: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+    std::env::var("DYN_ROUTER_PREFILL_EMA_CAP_MS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(120_000.0)
+});
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PrefillLoadState {
     pub(super) initial_effective_prefill_tokens: usize,
@@ -203,6 +255,14 @@ pub(super) struct PrefillLoadTracker {
     pub(super) prefill_order: VecDeque<RequestId>,
     pub(super) prefill_full_tokens_sum: usize,
     pub(super) unmodeled_prefill_count: usize,
+    /// EMA-decay: per-request charge timestamp (when active_prefill_tokens was
+    /// booked). Populated only when `EMA_ENABLE`. Used to measure the
+    /// charge->mark_prefill_completed latency folded into `ema_completion_ms`.
+    charge_times: HashMap<RequestId, Instant>,
+    /// EMA-decay: this worker's exponential moving average (ms) of observed
+    /// charge->completion latency. `None` until the first completion; then used
+    /// (clamped) as the synthesized `expected_prefill_duration` for new charges.
+    ema_completion_ms: Option<f64>,
     /// The front of `prefill_order` plus its effective decay anchor time.
     ///
     /// This anchors both token decay and modeled-time decay. It starts as the
@@ -215,9 +275,25 @@ impl PrefillLoadTracker {
     pub(super) fn insert(
         &mut self,
         request_id: &RequestId,
-        prefill: PrefillLoadState,
+        mut prefill: PrefillLoadState,
         decay_now: Instant,
     ) {
+        // EMA-decay: override the synthesized/modeled decay window with this
+        // worker's running EMA of observed charge->completion latency, clamped
+        // to [floor, cap]. Seeds from the incoming (decay-floor/AIC) duration
+        // until the first completion is observed, so behavior starts identical
+        // to the fixed-rate baseline and then self-calibrates. No-op when off.
+        if *EMA_ENABLE {
+            let seed_ms = prefill
+                .expected_prefill_duration
+                .map(|d| d.as_secs_f64() * 1000.0)
+                .unwrap_or(*EMA_FLOOR_MS);
+            let base_ms = self.ema_completion_ms.unwrap_or(seed_ms);
+            let clamped_ms = base_ms.clamp(*EMA_FLOOR_MS, *EMA_CAP_MS);
+            prefill.expected_prefill_duration = Some(Duration::from_secs_f64(clamped_ms / 1000.0));
+            self.charge_times.insert(request_id.clone(), decay_now);
+        }
+
         self.prefills.insert(request_id.clone(), prefill);
         self.prefill_full_tokens_sum += prefill.initial_effective_prefill_tokens;
         if prefill.expected_prefill_duration.is_none() {
@@ -230,11 +306,33 @@ impl PrefillLoadTracker {
         }
     }
 
+    /// EMA-decay: fold a genuine prefill completion (mark_prefill_completed)
+    /// into this worker's EMA of charge->completion latency. Must be called
+    /// BEFORE [`Self::remove`] (which clears the charge timestamp). No-op when
+    /// disabled, or when the request was never charged here (e.g. cancelled
+    /// before completion, or the charge was not replicated to this replica).
+    pub(super) fn note_completion(&mut self, request_id: &RequestId, decay_now: Instant) {
+        if !*EMA_ENABLE {
+            return;
+        }
+        let Some(charged_at) = self.charge_times.get(request_id) else {
+            return;
+        };
+        let latency_ms = decay_now.saturating_duration_since(*charged_at).as_secs_f64() * 1000.0;
+        self.ema_completion_ms = Some(match self.ema_completion_ms {
+            None => latency_ms,
+            Some(prev) => *EMA_ALPHA * latency_ms + (1.0 - *EMA_ALPHA) * prev,
+        });
+    }
+
     pub(super) fn remove(
         &mut self,
         request_id: &RequestId,
         decay_now: Instant,
     ) -> Option<PrefillLoadState> {
+        // EMA-decay bookkeeping: always release the charge timestamp (kept in
+        // lockstep with `prefills`); no-op when the map is empty (EMA disabled).
+        self.charge_times.remove(request_id);
         let prefill = self.prefills.remove(request_id)?;
         self.prefill_full_tokens_sum = self
             .prefill_full_tokens_sum

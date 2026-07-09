@@ -35,6 +35,29 @@ pub const DEFAULT_MAX_BATCHED_TOKENS: u64 = 10_000_000;
 
 const ADMISSION_CHANNEL_CAPACITY: usize = 65_536;
 
+/// Assumed prefill throughput (tokens/sec) used to synthesize an
+/// `expected_prefill_duration` when the selected worker has no prefill-load
+/// model (`router_prefill_load_model=none`, the default). Read ONCE from
+/// `DYN_ROUTER_ASSUMED_PREFILL_TOK_PER_SEC` (default 50000.0) at first use, so
+/// the decay rate is tunable across runs WITHOUT rebuilding the image.
+///
+/// Rationale (decay-floor fix): with no model, this arm previously returned
+/// `None`, which makes the prefill tracker anchor the active-prefill-tokens
+/// signal at full and never decay it (the unmodeled `anchored_full` path in
+/// `crate::sequences::prefill_tracker`). Under decode-collapse the signal
+/// ratchets, the admission gate's wait runs away, and decode starves. Feeding a
+/// synthetic duration routes the tracker onto its all-modeled aggregate-drain
+/// (decay) path — preserving backpressure while killing the ratchet. When
+/// `DYN_ROUTER_PREFILL_EMA_ENABLE=1` this fixed value is used only as the
+/// pre-warmup seed for the per-worker adaptive EMA (see prefill_tracker.rs).
+static ASSUMED_PREFILL_TOK_PER_SEC: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+    std::env::var("DYN_ROUTER_ASSUMED_PREFILL_TOK_PER_SEC")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(50_000.0)
+});
+
 /// Entry in the priority queue, ordered by key (higher key = higher priority).
 struct QueueEntry<K: Ord + Eq> {
     key: K,
@@ -799,7 +822,12 @@ impl<
                     None
                 }
             },
-            None => None,
+            // decay-floor fix: no prefill-load model -> synthesize a duration so the
+            // tracker takes its aggregate-drain (decay) path instead of anchoring full.
+            // With EMA enabled this is only the pre-warmup seed (prefill_tracker.rs).
+            None => Some(Duration::from_secs_f64(
+                effective_isl as f64 / *ASSUMED_PREFILL_TOK_PER_SEC,
+            )),
         };
 
         Some(PrefillLoadHint {
