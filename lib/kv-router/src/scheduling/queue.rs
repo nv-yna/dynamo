@@ -508,6 +508,27 @@ impl<
                 }
             }
             tracing::debug!("all workers prefill-busy, queueing request");
+            // RATCHETLOG: gate-trip (PARK) event -- the busiest eligible worker's
+            // active_prefill_tokens vs threshold*max_num_batched_tokens at park time.
+            if let Some((wid, dp, busiest_tokens, total_tokens, cap)) =
+                self.prefill_gate_diagnostic(threshold, request.eligibility(), decay_now)
+            {
+                let ratchet_ts_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                tracing::info!(
+                    request_id = request.maybe_request_id.as_deref().unwrap_or("unknown"),
+                    worker_id = wid,
+                    dp_rank = dp,
+                    worker_type = self.worker_type,
+                    active_prefill_tokens = busiest_tokens,
+                    total_active_prefill_tokens = total_tokens,
+                    threshold_x_maxbatched = cap,
+                    ts_ns = ratchet_ts_ns,
+                    "RATCHETLOG gate_park queue.rs"
+                );
+            }
             let arrival_offset = self.start_time.elapsed();
             let key = {
                 let workers = self.workers_with_configs.borrow();
@@ -728,6 +749,29 @@ impl<
             request.track_prefill_tokens,
         );
 
+        // RATCHETLOG: prefill-token ratchet decomposition -- the admission counter input.
+        // conv_id is NOT reachable at this scheduler boundary, so request_id only.
+        {
+            let ratchet_cached = selection.cached_tokens.min(request.isl_tokens);
+            let ratchet_effective_isl = request.isl_tokens.saturating_sub(ratchet_cached);
+            let ratchet_ts_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            tracing::info!(
+                request_id = %request_id,
+                worker_id = selection.worker.worker_id,
+                dp_rank = selection.worker.dp_rank,
+                worker_type = self.worker_type,
+                isl_tokens = request.isl_tokens,
+                cached_tokens = selection.cached_tokens,
+                effective_isl = ratchet_effective_isl,
+                track_prefill_tokens = request.track_prefill_tokens,
+                ts_ns = ratchet_ts_ns,
+                "RATCHETLOG prefill_admit queue.rs"
+            );
+        }
+
         let sequence_request = SequenceRequest {
             request_id,
             token_sequence: request.token_seq.take(),
@@ -864,6 +908,40 @@ impl<
         });
 
         checked_any && !has_available
+    }
+
+    /// RATCHETLOG diagnostic (read-only, side-effect free): at a PARK event, return the
+    /// busiest eligible worker's prefill-token load so the gate quantity can be tracked
+    /// over time offline. Returns
+    /// `(worker_id, dp_rank, busiest_active_prefill_tokens, total_active_prefill_tokens_over_eligible,
+    /// threshold * max_num_batched_tokens_for_busiest)`. Emits ONE summary line per park (no
+    /// per-candidate-worker spam). Mirrors `all_workers_prefill_busy`'s eligibility walk.
+    fn prefill_gate_diagnostic(
+        &self,
+        threshold: f64,
+        eligibility: RoutingEligibility<'_>,
+        decay_now: Instant,
+    ) -> Option<(WorkerId, u32, usize, usize, f64)> {
+        let active_tokens = self.slots.active_tokens(decay_now);
+        let configs = self.workers_with_configs.borrow();
+        let mut busiest: Option<(WorkerId, u32, usize, f64)> = None;
+        let mut total: usize = 0;
+        eligibility.for_each_eligible_worker_rank(&configs, |worker, config| {
+            let max_batched = config
+                .max_num_batched_tokens()
+                .unwrap_or(DEFAULT_MAX_BATCHED_TOKENS);
+            let tokens = active_tokens.get(&worker).copied().unwrap_or(0);
+            total = total.saturating_add(tokens);
+            let cap = threshold * (max_batched as f64);
+            let is_new_max = match busiest {
+                Some((_, _, t, _)) => tokens > t,
+                None => true,
+            };
+            if is_new_max {
+                busiest = Some((worker.worker_id, worker.dp_rank, tokens, cap));
+            }
+        });
+        busiest.map(|(wid, dp, t, cap)| (wid, dp, t, total, cap))
     }
 }
 

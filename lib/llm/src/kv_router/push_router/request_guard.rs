@@ -327,6 +327,18 @@ impl RequestGuard {
                 .as_ref()
                 .is_some_and(|data| !data.token_ids.is_empty());
             if has_tokens {
+                // RATCHETLOG: first-token removal event. lingering = this ts_ns - the
+                // matching RATCHETLOG prefill_admit ts_ns (joined offline by request_id).
+                let ratchet_ts_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                tracing::info!(
+                    request_id = %self.cleanup.context_id,
+                    scheduler_tracked = self.cleanup.scheduler_tracked,
+                    ts_ns = ratchet_ts_ns,
+                    "RATCHETLOG prefill_completed request_guard.rs"
+                );
                 if self.cleanup.scheduler_tracked
                     && let Err(error) = self
                         .cleanup

@@ -18,6 +18,7 @@ import dataclasses
 import logging
 import os
 import re
+import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
@@ -931,6 +932,41 @@ class HandlerBase(BaseGenerativeHandler):
             logging.critical("Forcing process exit for restart")
             os._exit(1)
 
+    @staticmethod
+    def _ratchet_extract_kv_transfer_timing(output) -> str:
+        """RATCHETLOG: best-effort KV-transfer timing from the engine output.
+
+        Confirms (or refutes) the INFERRED link that the CTX prefill response is gated
+        on the NIXL KV-transfer. request_perf_metrics is populated only when the engine
+        runs with return_perf_metrics=true; on a perf-OFF baseline it is None, so this
+        returns an explicit 'unavailable' marker rather than failing.
+        """
+        try:
+            perf = getattr(output, "request_perf_metrics", None)
+            if perf is None:
+                return "kv_transfer=perf_metrics_unavailable(perf_off)"
+            timing = getattr(perf, "timing_metrics", None)
+            if timing is None:
+                return "kv_transfer=timing_metrics_unavailable"
+            fields = []
+            for attr in (
+                "kv_cache_transfer_start",
+                "kv_cache_transfer_end",
+                "kv_cache_size",
+                "arrival_time",
+                "first_scheduled_time",
+                "first_token_time",
+                "last_token_time",
+            ):
+                val = getattr(timing, attr, None)
+                if val is not None:
+                    fields.append(f"{attr}={val}")
+            if not fields:
+                return "kv_transfer=timing_present_no_transfer_fields"
+            return "kv_transfer[" + ",".join(fields) + "]"
+        except Exception as exc:  # never let instrumentation break the request path
+            return f"kv_transfer=extract_error({exc})"
+
     async def generate_locally(
         self,
         request: dict,
@@ -1244,6 +1280,15 @@ class HandlerBase(BaseGenerativeHandler):
                 abort_guard or generation_result, context
             ):
                 async for res in generation_result:
+                    # RATCHETLOG: timestamp the moment the engine handed us this result.
+                    # For PREFILL (disagg CTX) this res arrives already post-KV-transfer
+                    # per the held-response mechanism; paired with response_yield below.
+                    if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                        _ratchet_ctx_recv_mono_ns = time.monotonic_ns()
+                        _ratchet_ctx_recv_wall_ns = time.time_ns()
+                    else:
+                        _ratchet_ctx_recv_mono_ns = None
+                        _ratchet_ctx_recv_wall_ns = None
                     # Signal first token to deferred abort guard
                     if abort_guard is not None:
                         abort_guard.signal_first_token()
@@ -1348,6 +1393,24 @@ class HandlerBase(BaseGenerativeHandler):
                                 "prompt_tokens_details": prompt_tokens_details,
                             }
 
+                        # RATCHETLOG: CTX single-response yield. Joins by request_id with
+                        # the router's RATCHETLOG prefill_completed (removal). The
+                        # response_yield - ctx_res_recv delta is intra-process (monotonic);
+                        # wall_ns is epoch (rough cross-node correlation with router logs).
+                        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                            logging.info(
+                                "RATCHETLOG ctx_yield request_id=%s "
+                                "ctx_res_recv_mono_ns=%s ctx_res_recv_wall_ns=%s "
+                                "response_yield_mono_ns=%s response_yield_wall_ns=%s "
+                                "res_finished=%s %s",
+                                context.id(),
+                                _ratchet_ctx_recv_mono_ns,
+                                _ratchet_ctx_recv_wall_ns,
+                                time.monotonic_ns(),
+                                time.time_ns(),
+                                res.finished,
+                                self._ratchet_extract_kv_transfer_timing(output),
+                            )
                         # Yield the chunk to the client and update the token
                         # count for this output choice.
                         yield out

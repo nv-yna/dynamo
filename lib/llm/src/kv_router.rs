@@ -649,6 +649,28 @@ where
         let prefill_load_hint =
             self.prefill_load_hint_for(isl_tokens, cached_tokens, track_prefill_tokens);
 
+        // RATCHETLOG: prefill-token ratchet decomposition -- the admission counter input on
+        // the direct add_request path. conv_id is NOT reachable here, so request_id only.
+        {
+            let ratchet_cached = cached_tokens.min(isl_tokens);
+            let ratchet_effective_isl = isl_tokens.saturating_sub(ratchet_cached);
+            let ratchet_ts_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            tracing::info!(
+                request_id = %request_id,
+                worker_id = worker.worker_id,
+                dp_rank = worker.dp_rank,
+                isl_tokens,
+                cached_tokens,
+                effective_isl = ratchet_effective_isl,
+                track_prefill_tokens,
+                ts_ns = ratchet_ts_ns,
+                "RATCHETLOG prefill_admit kv_router.rs"
+            );
+        }
+
         if let Err(e) = self
             .scheduler
             .add_request(SequenceRequest {
