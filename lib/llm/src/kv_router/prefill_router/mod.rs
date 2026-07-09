@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
@@ -33,6 +33,19 @@ mod types;
 use inner::InnerPrefillRouter;
 pub use types::{PrefillError, PrefillQueryOutcome};
 use types::{PrefillOutcome, PrefillResolveDecision, build_decode_router_override};
+
+/// `DYN_PREFILL_CTX_FIRST`: when enabled (`1`/`true`), force the synchronous
+/// "context-first" prefill lifecycle in the resolved-bootstrap arm of
+/// `generate()` — await prefill completion before dispatching the decode
+/// request, instead of the default bootstrap early-dispatch (spawn prefill in
+/// the background and route decode concurrently). Parsed once for the process
+/// lifetime; when unset/other the off path is byte-identical to the prior
+/// bootstrap behavior, giving a clean A/B. See the `Resolved` arm below.
+static PREFILL_CTX_FIRST: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("DYN_PREFILL_CTX_FIRST")
+        .ok()
+        .is_some_and(|v| v == "1" || v == "true")
+});
 
 /// PrefillRouter is a forward-only operator that sits between Migration and the decode router.
 /// It optionally calls a prefill worker before routing to decode, extracting disaggregated_params
@@ -157,48 +170,90 @@ impl
                 let topology_constraints =
                     self.preflight_kv_transfer_constraints(endpoint_id, Some(worker_id))?;
 
-                // Bootstrap optimization path: spawn prefill in background
+                // Commit the router-selected prefill worker before either dispatch
+                // strategy so round-robin cursor state advances identically whether
+                // the flag is on or off.
                 self.commit_selected_prefill_worker(
                     &mut prefill_req,
                     worker_id,
                     dp_rank,
                     preselected_worker,
                 );
-                prefill_req.bootstrap_info = Some(bootstrap_info.clone());
 
-                // NVBugs 5969206: Do NOT link prefill as child of engine context.
-                // Kill propagation tears down the RPC transport, interrupting NIXL
-                // KV cache transfers and leaking blocks permanently. The prefill
-                // runs to completion independently; blocks are freed via the normal
-                // completion path (state 21→22).
-                // NOTE: This means prefill runs to completion even if the client
-                // disconnects, wasting prefill compute. This is an accepted
-                // trade-off (wasted compute vs permanent KV block leak). Future
-                // work: add NIXL-level cancellation that properly frees blocks.
-                let prefill_context = Context::with_id_and_metadata(
-                    prefill_req,
-                    request_id.clone(),
-                    metadata.clone(),
-                );
+                if *PREFILL_CTX_FIRST {
+                    // DYN_PREFILL_CTX_FIRST override: force the synchronous
+                    // "context-first" lifecycle. Await prefill completion here
+                    // before dispatching decode, mirroring the NoBootstrapEndpoint
+                    // arm below. bootstrap_info is intentionally NOT set on the
+                    // prefill request: the decode side consumes the
+                    // prefill_result/disaggregated_params handoff instead of a
+                    // bootstrap pull, matching native context-first serving.
+                    //
+                    // Drop the phase barrier because we wait for prefill completion
+                    // in this task, so there is no race with set_phase(Decode) below.
+                    drop(prefill_phase_barrier);
 
-                // Pass the phase barrier to the spawned task. It is released after routing
-                // completes so worker recording finishes before phase changes to Decode.
-                // The prefill trace (carrying a/b) is moved into the spawned task, which
-                // is the path that runs under load; it records c/d/e and emits there.
-                self.spawn_prefill_task(
-                    prefill_context,
-                    Some(worker_id),
-                    prefill_phase_barrier,
-                    prefill_trace.take(),
-                );
+                    // NVBugs 5969206: Do NOT link prefill as child of engine context
+                    // (same rationale as the bootstrap path below).
+                    let prefill_context = Context::with_id_and_metadata(
+                        prefill_req,
+                        request_id.clone(),
+                        metadata.clone(),
+                    );
+                    let completion = Self::execute_prefill(
+                        self.prefill_router.get().cloned(),
+                        prefill_context,
+                        Some(worker_id),
+                        None,
+                        prefill_trace.take(),
+                    )
+                    .await?;
+                    (
+                        Ok(PrefillOutcome::Completed {
+                            result: completion.result,
+                            worker_id: Some(worker_id),
+                            worker_link: completion.worker_link,
+                        }),
+                        topology_constraints,
+                    )
+                } else {
+                    // Bootstrap optimization path (default): spawn prefill in background
+                    prefill_req.bootstrap_info = Some(bootstrap_info.clone());
 
-                (
-                    Ok(PrefillOutcome::Bootstrap {
-                        bootstrap_info,
-                        worker_id,
-                    }),
-                    topology_constraints,
-                )
+                    // NVBugs 5969206: Do NOT link prefill as child of engine context.
+                    // Kill propagation tears down the RPC transport, interrupting NIXL
+                    // KV cache transfers and leaking blocks permanently. The prefill
+                    // runs to completion independently; blocks are freed via the normal
+                    // completion path (state 21→22).
+                    // NOTE: This means prefill runs to completion even if the client
+                    // disconnects, wasting prefill compute. This is an accepted
+                    // trade-off (wasted compute vs permanent KV block leak). Future
+                    // work: add NIXL-level cancellation that properly frees blocks.
+                    let prefill_context = Context::with_id_and_metadata(
+                        prefill_req,
+                        request_id.clone(),
+                        metadata.clone(),
+                    );
+
+                    // Pass the phase barrier to the spawned task. It is released after routing
+                    // completes so worker recording finishes before phase changes to Decode.
+                    // The prefill trace (carrying a/b) is moved into the spawned task, which
+                    // is the path that runs under load; it records c/d/e and emits there.
+                    self.spawn_prefill_task(
+                        prefill_context,
+                        Some(worker_id),
+                        prefill_phase_barrier,
+                        prefill_trace.take(),
+                    );
+
+                    (
+                        Ok(PrefillOutcome::Bootstrap {
+                            bootstrap_info,
+                            worker_id,
+                        }),
+                        topology_constraints,
+                    )
+                }
             }
             PrefillResolveDecision::Backpressure {
                 reason,
