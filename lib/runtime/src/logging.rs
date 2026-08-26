@@ -93,6 +93,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::config::environment_names::logging as env_logging;
+use crate::telemetry::{LIFECYCLE_TARGET, lifecycle_tracing_enabled};
 
 /// Default log level
 const DEFAULT_FILTER_LEVEL: &str = "info";
@@ -1269,7 +1270,7 @@ fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
 fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
     let fmt_filter_layer = filters(load_config());
     let trace_filter_layer = filters(load_config());
-    let otel_filter_layer = filters(load_config());
+    let otel_filter_layer = otel_filters(load_config(), lifecycle_tracing_enabled());
     let otel_logs_filter_layer = filters(load_config());
     let jsonl_enabled = jsonl_logging_enabled();
     let otlp_enabled = otlp_exporter_enabled();
@@ -1421,7 +1422,205 @@ fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn filters(config: LoggingConfig) -> EnvFilter {
+#[allow(clippy::large_enum_variant)] // Constructed once during logging initialization.
+enum LoggingFilter {
+    Targets(Targets),
+    Env(EnvFilter),
+}
+
+impl<S> Filter<S> for LoggingFilter {
+    #[inline]
+    fn enabled(&self, meta: &tracing::Metadata<'_>, cx: &Context<'_, S>) -> bool {
+        match self {
+            Self::Targets(filter) => <Targets as Filter<S>>::enabled(filter, meta, cx),
+            Self::Env(filter) => <EnvFilter as Filter<S>>::enabled(filter, meta, cx),
+        }
+    }
+
+    #[inline]
+    fn callsite_enabled(
+        &self,
+        meta: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        match self {
+            Self::Targets(filter) => <Targets as Filter<S>>::callsite_enabled(filter, meta),
+            Self::Env(filter) => <EnvFilter as Filter<S>>::callsite_enabled(filter, meta),
+        }
+    }
+
+    #[inline]
+    fn event_enabled(&self, event: &Event<'_>, cx: &Context<'_, S>) -> bool {
+        match self {
+            Self::Targets(filter) => <Targets as Filter<S>>::event_enabled(filter, event, cx),
+            Self::Env(filter) => <EnvFilter as Filter<S>>::event_enabled(filter, event, cx),
+        }
+    }
+
+    #[inline]
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        match self {
+            Self::Targets(filter) => <Targets as Filter<S>>::max_level_hint(filter),
+            Self::Env(filter) => <EnvFilter as Filter<S>>::max_level_hint(filter),
+        }
+    }
+
+    #[inline]
+    fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &Id, cx: Context<'_, S>) {
+        if let Self::Env(filter) = self {
+            <EnvFilter as Filter<S>>::on_new_span(filter, attrs, id, cx);
+        }
+    }
+
+    #[inline]
+    fn on_record(&self, id: &Id, values: &span::Record<'_>, cx: Context<'_, S>) {
+        if let Self::Env(filter) = self {
+            <EnvFilter as Filter<S>>::on_record(filter, id, values, cx);
+        }
+    }
+
+    #[inline]
+    fn on_enter(&self, id: &Id, cx: Context<'_, S>) {
+        if let Self::Env(filter) = self {
+            <EnvFilter as Filter<S>>::on_enter(filter, id, cx);
+        }
+    }
+
+    #[inline]
+    fn on_exit(&self, id: &Id, cx: Context<'_, S>) {
+        if let Self::Env(filter) = self {
+            <EnvFilter as Filter<S>>::on_exit(filter, id, cx);
+        }
+    }
+
+    #[inline]
+    fn on_close(&self, id: Id, cx: Context<'_, S>) {
+        if let Self::Env(filter) = self {
+            <EnvFilter as Filter<S>>::on_close(filter, id, cx);
+        }
+    }
+}
+
+#[derive(Debug)]
+enum TargetsFilterFallback {
+    Dynamic,
+    Other,
+}
+
+/// Build the OpenTelemetry-layer filter.
+///
+/// Lifecycle spans bypass `DYN_LOG` only in the OTel layer. The console
+/// formatter keeps its normal filter, so enabling lifecycle tracing does not
+/// increase stderr logging volume.
+fn otel_filters(mut config: LoggingConfig, lifecycle_enabled: bool) -> LoggingFilter {
+    if lifecycle_enabled {
+        config
+            .log_filters
+            .insert(LIFECYCLE_TARGET.to_string(), "info".to_string());
+    }
+    filters(config)
+}
+
+fn filters(config: LoggingConfig) -> LoggingFilter {
+    let targets = match std::env::var(env_logging::DYN_LOG) {
+        Ok(value) => targets_filter(&config, Some(&value)),
+        Err(std::env::VarError::NotPresent) => targets_filter(&config, None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(TargetsFilterFallback::Other),
+    };
+
+    match targets {
+        Ok(filter) => LoggingFilter::Targets(filter),
+        Err(TargetsFilterFallback::Dynamic) => {
+            // Logging has not been initialized yet, so write directly to stderr
+            // rather than through tracing. This must remain visible even when the
+            // configured dynamic filter excludes WARN-level events.
+            eprintln!(
+                "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\
+                 !!! WARNING: DYNAMIC LOG FILTERS FORCE THE EnvFilter FALLBACK !!!\n\
+                 !!! This disables Dynamo's lock-free logging fast path and can severely\n\
+                 !!! degrade request performance, especially for streaming responses.\n\
+                 !!! Remove span/field selectors ([...]) from DYN_LOG or log_filters to\n\
+                 !!! re-enable the fast target/level filter.\n\
+                 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+            );
+            LoggingFilter::Env(env_filter(&config))
+        }
+        Err(TargetsFilterFallback::Other) => LoggingFilter::Env(env_filter(&config)),
+    }
+}
+
+/// Use the lock-free target/level filter when `DYN_LOG` contains no dynamic
+/// span or field directives. `EnvFilter` tracks dynamic span matches behind an
+/// `RwLock`, and its span lifecycle callbacks acquire that lock even when the
+/// configured directives are all static.
+fn targets_filter(
+    config: &LoggingConfig,
+    dyn_log: Option<&str>,
+) -> Result<Targets, TargetsFilterFallback> {
+    // `EnvFilter::parse_lossy` ignores zero-length comma-separated segments,
+    // but leaves all other text untouched. In particular, do not trim here:
+    // whitespace may make the directive dynamic or invalid.
+    let dyn_directives = dyn_log
+        .into_iter()
+        .flat_map(|value| value.split(',').filter(|directive| !directive.is_empty()));
+
+    let mut directives = Vec::new();
+    for directive in dyn_directives {
+        // Parsing as `Targets` is also the feature test for whether the
+        // configured directive requires EnvFilter's dynamic span matching.
+        targets_compatible(directive)?;
+        directives.push(directive.to_string());
+    }
+
+    // EnvFilter uses the configured default only when DYN_LOG is absent or
+    // contains no directives. A target-only DYN_LOG must leave other targets
+    // disabled rather than inheriting the configured default level.
+    if directives.is_empty() {
+        directives.push(config.log_level.clone());
+    }
+
+    for (module, level) in &config.log_filters {
+        let directive = format!("{module}={level}");
+        match targets_compatible(&directive) {
+            Ok(()) => directives.push(directive),
+            Err(fallback) => match directive.parse::<Directive>() {
+                // Valid span or field directives require EnvFilter's dynamic
+                // matching, so do not silently drop a configured filter.
+                Ok(_) => return Err(fallback),
+                // Preserve the pre-fast-path warn-and-ignore behavior for
+                // directives that neither parser accepts.
+                Err(e) => {
+                    eprintln!("Failed parsing filter '{level}' for module '{module}': {e}");
+                }
+            },
+        }
+    }
+
+    if span_events_enabled() {
+        directives.push("span_event=trace".to_string());
+    }
+
+    directives.push("request_span=trace".to_string());
+    directives
+        .join(",")
+        .parse::<Targets>()
+        .map_err(|_| TargetsFilterFallback::Other)
+}
+
+/// An opening `[` begins EnvFilter's span or field selector grammar. Targets
+/// accepts some bracketed forms as literal targets or static field filters, but
+/// routing every bracketed directive through EnvFilter keeps the configuration
+/// language consistent. Curly braces alone remain ordinary target characters.
+fn targets_compatible(directive: &str) -> Result<(), TargetsFilterFallback> {
+    if directive.contains('[') {
+        Err(TargetsFilterFallback::Dynamic)
+    } else if directive.parse::<Targets>().is_ok() {
+        Ok(())
+    } else {
+        Err(TargetsFilterFallback::Other)
+    }
+}
+
+fn env_filter(config: &LoggingConfig) -> EnvFilter {
     let mut filter_layer = EnvFilter::builder()
         .with_default_directive(config.log_level.parse().unwrap())
         .with_env_var(env_logging::DYN_LOG)
