@@ -6,6 +6,7 @@ use std::sync::LazyLock;
 use axum::http::StatusCode;
 use dynamo_runtime::config::environment_names::llm as env_llm;
 use thiserror::Error;
+use dynamo_runtime::error::{DynamoError, ErrorType as DynamoErrorType};
 
 /// Overload / admission-control rejection status. Reads
 /// `DYN_HTTP_OVERLOAD_STATUS_CODE` (default 529); cached since env is fixed at
@@ -23,6 +24,17 @@ pub(crate) fn overload_status_code() -> StatusCode {
 }
 
 /// Implementation of the Completion Engines served by the HTTP service should
+
+/// Construct a typed invalid-argument error for validation performed at an
+/// HTTP protocol adapter boundary. (Ported alongside the M2 lifecycle
+/// terminal-outcome cherry-pick; the DynamoError machinery already exists here.)
+pub(crate) fn invalid_argument(message: impl Into<String>) -> DynamoError {
+    DynamoError::builder()
+        .error_type(DynamoErrorType::InvalidArgument)
+        .message(message)
+        .build()
+}
+
 /// map their custom errors to to this error type if they wish to return error
 /// codes besides 500.
 #[derive(Debug, Error)]
