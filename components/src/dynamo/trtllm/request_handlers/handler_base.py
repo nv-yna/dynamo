@@ -1157,6 +1157,13 @@ class HandlerBase(BaseGenerativeHandler):
         )
 
         request_id = request.get("id") or request.get("request_id", "unknown-id")
+        # The July-era request payload carries no id field on this path; the
+        # Dynamo request UUID lives on the runtime Context. Verified on run
+        # 2815477: request.get() yielded "unknown-id" on 1789/1789 requests.
+        try:
+            join_request_id = str(context.id()) or request_id
+        except Exception:
+            join_request_id = request_id
 
         # Optional test-only logits processing (enable with DYN_ENABLE_TEST_LOGITS_PROCESSOR=1)
         if os.getenv("DYN_ENABLE_TEST_LOGITS_PROCESSOR") == "1":
@@ -1313,7 +1320,7 @@ class HandlerBase(BaseGenerativeHandler):
             # is a per-worker-process counter: join within this log file only.
             logging.info(
                 "Engine ID map: request_id=%s trtllm_client_id=%s disagg_request_id=%s",
-                request_id,
+                join_request_id,
                 getattr(generation_result, "request_id", None),
                 disaggregated_params.disagg_request_id
                 if disaggregated_params
@@ -1457,7 +1464,7 @@ class HandlerBase(BaseGenerativeHandler):
                     # DYN_TRTLLM_PERF_METRICS_DIR (fast no-op when unset).
                     if res.finished:
                         maybe_dump_perf_metrics(
-                            request_id=request_id,
+                            request_id=join_request_id,
                             role=self.disaggregation_mode.name.lower(),
                             generation_result=generation_result,
                             res=res,
