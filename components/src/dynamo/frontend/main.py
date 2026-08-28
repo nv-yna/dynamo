@@ -256,6 +256,13 @@ def parse_args() -> tuple[FrontendConfig, Optional[Namespace], Optional[Namespac
 
     args, unknown = parser.parse_known_args()
 
+    # TEST-BRANCH SHIM: srt-slurm-era launchers still pass --router-reset-states,
+    # which the frontend CLI refactor removed upstream. Accept and ignore it so
+    # the July-era launch command keeps working against this build.
+    if "--router-reset-states" in unknown:
+        logger.warning("Ignoring deprecated flag --router-reset-states (removed upstream)")
+        unknown = [a for a in unknown if a != "--router-reset-states"]
+
     config = FrontendConfig.from_cli_args(args)
     config.validate()
 
