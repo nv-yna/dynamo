@@ -56,6 +56,7 @@ from dynamo.trtllm.engine import TensorRTLLMEngine
 from dynamo.trtllm.logits_processing.adapter import create_trtllm_adapters
 from dynamo.trtllm.metrics import AdditionalMetricsCollector
 from dynamo.trtllm.multimodal_processor import MultimodalRequestProcessor
+from dynamo.trtllm.perf_metrics_dump import maybe_dump_perf_metrics
 from dynamo.trtllm.publisher import Publisher
 from dynamo.trtllm.request_handlers.base_generative_handler import BaseGenerativeHandler
 from dynamo.trtllm.utils.disagg_utils import (
@@ -1303,6 +1304,22 @@ class HandlerBase(BaseGenerativeHandler):
                 else None,
             )
 
+            # One INFO line per request pairing the Dynamo request UUID with the
+            # TRT-LLM executor client ID and (disagg) the cross-phase
+            # disagg_request_id -- the only point where all three coexist. This
+            # is the offline join contract between Dynamo traces/spans/logs and
+            # engine-side per-request records. Logged before iteration starts so
+            # cancelled requests still leave their mapping behind. The client ID
+            # is a per-worker-process counter: join within this log file only.
+            logging.info(
+                "Engine ID map: request_id=%s trtllm_client_id=%s disagg_request_id=%s",
+                request_id,
+                getattr(generation_result, "request_id", None),
+                disaggregated_params.disagg_request_id
+                if disaggregated_params
+                else None,
+            )
+
             # In disagg decode mode with remote prefill, wrap abort() to defer
             # until the first token is received (KV transfer complete).
             abort_guard = (
@@ -1433,6 +1450,19 @@ class HandlerBase(BaseGenerativeHandler):
                         # the outermost hop into Rust pushes.
                         yield out
                         output_tokens_per_choice[output_idx] = next_total_toks
+
+                    # Per-request engine perf-metrics JSONL dump ("Option A").
+                    # Independent of metrics_collector: that requires
+                    # publish_events_and_metrics, while this is gated only on
+                    # DYN_TRTLLM_PERF_METRICS_DIR (fast no-op when unset).
+                    if res.finished:
+                        maybe_dump_perf_metrics(
+                            request_id=request_id,
+                            role=self.disaggregation_mode.name.lower(),
+                            generation_result=generation_result,
+                            res=res,
+                            disaggregated_params=disaggregated_params,
+                        )
 
                     # Record additional metrics on request finish once per iteration.
                     if res.finished and metrics_collector:
