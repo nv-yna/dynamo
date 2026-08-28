@@ -37,6 +37,8 @@ use serde::{Deserialize, Serialize};
 use tracing::level_filters::LevelFilter;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::Targets;
+use tracing_subscriber::layer::Filter;
 use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::fmt::time::LocalTime;
 use tracing_subscriber::fmt::time::SystemTime;
@@ -1626,7 +1628,7 @@ fn env_filter(config: &LoggingConfig) -> EnvFilter {
         .with_env_var(env_logging::DYN_LOG)
         .from_env_lossy();
 
-    for (module, level) in config.log_filters {
+    for (module, level) in &config.log_filters {
         match format!("{module}={level}").parse::<Directive>() {
             Ok(d) => {
                 filter_layer = filter_layer.add_directive(d);
