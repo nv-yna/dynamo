@@ -428,6 +428,12 @@ struct ParsedRequest<Req> {
     payload_codec: RequestPlanePayloadCodec,
 }
 
+#[derive(Clone, Copy)]
+struct ResponsePlaneModes {
+    configured: ResponsePlaneMode,
+    advertised: ResponsePlaneMode,
+}
+
 /// Per-shape strategy for turning a raw payload into a typed engine
 /// request. Captures the wire-shape divergence between the unary
 /// (`HeaderAndData`) and bidirectional (`HeaderOnly` + dial-in for the
@@ -644,8 +650,7 @@ where
         request: Req,
         payload_codec: RequestPlanePayloadCodec,
         start_time: Instant,
-        configured_mode: ResponsePlaneMode,
-        advertised_mode: ResponsePlaneMode,
+        response_modes: ResponsePlaneModes,
         lifecycle: &LifecycleTrace,
         mut publisher: P,
     ) -> Result<(), PipelineError>
@@ -653,6 +658,11 @@ where
         Self: IngressDispatch<Request = Req>,
         P: ResponsePublisher,
     {
+        let ResponsePlaneModes {
+            configured: configured_mode,
+            advertised: advertised_mode,
+        } = response_modes;
+
         if configured_mode != advertised_mode {
             let message = format!(
                 "response plane mismatch: frontend requested {}, worker configured {}",
@@ -820,6 +830,10 @@ where
                 .map_err(|error| PipelineError::Generic(error.to_string()))?;
         let configured_mode = ResponsePlaneMode::configured()
             .map_err(|error| PipelineError::Generic(error.to_string()))?;
+        let response_modes = ResponsePlaneModes {
+            configured: configured_mode,
+            advertised: advertised_mode,
+        };
         let cancellation_counter = self
             .metrics()
             .map(|metrics| metrics.cancellation_total.clone());
@@ -848,8 +862,7 @@ where
                     request,
                     payload_codec,
                     start_time,
-                    configured_mode,
-                    advertised_mode,
+                    response_modes,
                     &lifecycle,
                     publisher,
                 )
@@ -882,8 +895,7 @@ where
                     request,
                     payload_codec,
                     start_time,
-                    configured_mode,
-                    advertised_mode,
+                    response_modes,
                     &lifecycle,
                     publisher,
                 )
@@ -1020,8 +1032,10 @@ mod tests {
                     Context::new(serde_json::json!({})),
                     RequestPlanePayloadCodec::Json,
                     Instant::now(),
-                    configured,
-                    advertised,
+                    ResponsePlaneModes {
+                        configured,
+                        advertised,
+                    },
                     &lifecycle,
                     publisher,
                 )
